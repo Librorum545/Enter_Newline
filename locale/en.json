@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Enter newline",
+    "description": "Makes Enter insert a line break in the composer; Ctrl/Cmd+Enter sends the draft. While an agent is running, Ctrl/Cmd+Enter follows the busy send preference, so with Steer selected it joins the running turn immediately. Completion menus still pick with Enter, and Shift+Enter keeps inserting a break."
+  }
+}

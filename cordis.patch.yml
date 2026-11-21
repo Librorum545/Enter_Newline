@@ -1,0 +1,3 @@
+- insert:
+    - id: composer-enter-newline
+      name: '@local/composer-enter-newline'

@@ -1,0 +1,75 @@
+# DSH / Cordis browser plugin — pure ESM JavaScript, no build step.
+# Only dependency installs, logs, local env and OS/editor clutter are ignored;
+# every shipped file (index.js, client.js, cordis.patch.yml, locale/, icon.svg)
+# stays tracked.
+
+# --- Dependencies ---
+node_modules/
+.pnpm-store/
+.yarn/
+jspm_packages/
+vendor/
+
+# --- Package manager logs ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Build, bundle & cache output ---
+dist/
+build/
+out/
+.cache/
+.turbo/
+.vite/
+.esbuild/
+.parcel-cache/
+*.tsbuildinfo
+
+# --- Test & coverage ---
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+playwright-report/
+blob-report/
+
+# --- Local env, secrets & publish tokens ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+.npmrc
+*.local
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# --- OS metadata ---
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Logs & scratch files ---
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# --- Packed release artifacts ---
+*.tgz
+*.zip
