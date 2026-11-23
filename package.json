@@ -1,6 +1,6 @@
 {
   "name": "@local/composer-enter-newline",
-  "version": "1.0.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Enter inserts a line break in the composer; Ctrl/Cmd+Enter sends the draft.",
   "license": "MIT",
@@ -10,6 +10,9 @@
     "url": "git+https://github.com/Librorum545/Enter_Newline.git"
   },
   "type": "module",
+  "scripts": {
+    "test": "node test/client.test.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

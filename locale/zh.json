@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Enter 换行",
-    "description": "让输入框中的 Enter 插入换行，Ctrl/Cmd+Enter 发送草稿。智能体运行中时，Ctrl/Cmd+Enter 按「繁忙时的发送行为」投递：选择「插话发送」即立刻注入当前回合。补全菜单打开时 Enter 仍用于选中候选项，Shift+Enter 也继续插入换行。"
+    "description": "让输入框中的 Enter 插入换行，Ctrl/Cmd+Enter 发送草稿。设置中提供「Enter 换行」一页：为 Enter、Ctrl/Cmd+Enter、Shift+Enter 分别指定插入换行、插话发送或排队发送，保存时校验映射是否还能正常换行与发送。"
   }
 }
