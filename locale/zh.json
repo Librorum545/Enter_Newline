@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "Enter 换行",
-    "description": "让输入框中的 Enter 插入换行，Ctrl/Cmd+Enter 发送草稿。设置中提供「Enter 换行」一页：为 Enter、Ctrl/Cmd+Enter、Shift+Enter 分别指定插入换行、插话发送或排队发送，保存时校验映射是否还能正常换行与发送。"
+    "description": "让输入框中的 Enter 插入换行，Ctrl/Cmd+Enter 发送草稿。设置中提供「Enter 换行」一页：为 Enter、Ctrl/Cmd+Enter、Shift+Enter 分别指定插入换行、插话发送或排队发送，保存时校验映射是否还能正常换行与发送。",
+    "detail": "docs/DETAIL.zh.md"
   }
 }

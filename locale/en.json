@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "Enter newline",
-    "description": "Makes Enter insert a line break in the composer; Ctrl/Cmd+Enter sends the draft. A dedicated settings page binds Enter, Ctrl/Cmd+Enter and Shift+Enter to a line break, steer or queue, and refuses a mapping that could no longer break a line or send."
+    "description": "Makes Enter insert a line break in the composer; Ctrl/Cmd+Enter sends the draft. A dedicated settings page binds Enter, Ctrl/Cmd+Enter and Shift+Enter to a line break, steer or queue, and refuses a mapping that could no longer break a line or send.",
+    "detail": "docs/DETAIL.md"
   }
 }

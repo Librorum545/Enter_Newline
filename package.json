@@ -1,23 +1,44 @@
 {
-  "name": "@local/composer-enter-newline",
+  "name": "dsh-enter-newline",
   "version": "1.2.1",
-  "private": true,
-  "description": "Enter inserts a line break in the composer; Ctrl/Cmd+Enter sends the draft.",
+  "description": "Enter inserts a line break in the composer; Ctrl/Cmd+Enter steers or queues. All three gestures are bound on a Settings page.",
   "license": "MIT",
   "author": "Librorum",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Librorum545/Enter_Newline.git"
   },
+  "homepage": "https://github.com/Librorum545/Enter_Newline#readme",
+  "bugs": {
+    "url": "https://github.com/Librorum545/Enter_Newline/issues"
+  },
   "type": "module",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "composer",
+    "keyboard",
+    "enter",
+    "newline",
+    "keymap",
+    "settings"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+  },
   "scripts": {
-    "test": "node test/client.test.mjs"
+    "test": "node test/client.test.mjs",
+    "prepublishOnly": "npm test"
   },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
@@ -25,7 +46,10 @@
     "cordis.patch.yml",
     "README.md",
     "locale/*.json",
-    "icon.svg"
+    "icon.svg",
+    "docs/DETAIL.md",
+    "docs/DETAIL.zh.md",
+    "docs/preview.svg"
   ],
   "dsh": {
     "bundle": {

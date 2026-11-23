@@ -32,10 +32,13 @@
  *
  *    Bindings persist in localStorage (`composer-enter-newline:bindings:v1`):
  *    a key map belongs to the browser that presses the keys, not to the shared
- *    settings document.
+ *    settings document. The storage key, the locale namespace and the slot ids
+ *    keep their original `composer-enter-newline` spelling on purpose: they are
+ *    internal identities, so renaming them with the package would orphan saved
+ *    bindings and re-register dictionaries for no user-visible gain.
  */
 window.__ModuleLoader__.load({
-  id: '@local/composer-enter-newline',
+  id: 'dsh-enter-newline',
   factory(require) {
     const React = require('react')
     const { useState } = React

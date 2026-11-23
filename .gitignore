@@ -70,6 +70,13 @@ temp/
 *.tmp
 *.bak
 
+# --- Local-only documentation ---
+# The maintainer's own publish/listing runbook: machine- and account-specific,
+# useful locally, never part of the plugin. Shipped documents under docs/
+# (DETAIL.md, DETAIL.zh.md, preview.svg) stay tracked — the package manifest
+# declares them and the market detail page loads them.
+docs/PUBLISH.md
+
 # --- Packed release artifacts ---
 *.tgz
 *.zip

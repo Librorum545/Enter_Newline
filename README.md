@@ -2,6 +2,20 @@
 
 把 DSH 输入框的发送键从 Enter 改成 Ctrl/Cmd+Enter，并允许在设置里重新分配三个按键：插入换行、插话发送、排队发送。
 
+## 安装
+
+```sh
+# npm
+dsh plugin --profile web add dsh-enter-newline
+
+# GitHub 源码（pnpm 第一次会要求放行构建脚本，按提示重试；建议钉定 commit）
+dsh plugin --profile web add github:Librorum545/Enter_Newline#<commit>
+```
+
+桌面端的 profile 由应用自己的插件管理器管理：在 **设置 → 插件** 的安装入口填入 `dsh-enter-newline`。装好后刷新页面，桌面端需要重启窗口。
+
+要求 DSH `>=0.2.2-rc.5 <0.3.0-0`，见 `package.json` 的 `engines.dsh`。
+
 ## 默认行为
 
 | 按键 | 默认动作 | 空闲会话 | 智能体运行中 |

@@ -53,7 +53,7 @@ const run = new Function('window', 'document', 'Element', 'KeyboardEvent', sourc
 run(fakeWindow, fakeDocument, FakeElement, FakeKeyboardEvent)
 
 const registration = fakeWindow.registration
-assert.equal(registration.id, '@local/composer-enter-newline')
+assert.equal(registration.id, 'dsh-enter-newline')
 
 const STORAGE_KEY = 'composer-enter-newline:bindings:v1'
 
