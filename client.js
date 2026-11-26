@@ -1,16 +1,17 @@
 /**
  * Browser half of the bundle.
  *
- * 1. Composer key remap, driven by a per-gesture binding the Settings page
- *    edits:
- *      Enter          (default: line break)
- *      Ctrl/Cmd+Enter (default: steer)
- *      Shift+Enter    (default: queue)
+ * 1. Composer key remap, driven by two whole presets the Settings page offers:
+ *      default preset ("follow DSH") — every gesture passes through untouched;
+ *        the page reads the live busy-Enter preference and shows what DSH does.
+ *      plugin preset — Enter / Ctrl·Cmd+Enter / Shift·Enter are remapped to
+ *        line break / steer / queue (each gesture editable on the page).
  *
- *    Every gesture resolves to one of three actions: insert a line break,
- *    steer (join the running turn), or queue (wait for the turn to finish).
- *    The actions replay into the composer's own event path, so its keymap, IME
- *    guard, menu arbitration, undo history and submit policy stay authoritative:
+ *    Every plugin-preset gesture resolves to one of three actions: insert a
+ *    line break, steer (join the running turn), or queue (wait for the turn to
+ *    finish). The actions replay into the composer's own event path, so its
+ *    keymap, IME guard, menu arbitration, undo history and submit policy stay
+ *    authoritative:
  *    - a line break becomes a Shift+Enter keydown; the composer's keymap leaves
  *      Shift+Enter to Lexical's plain-text plugin, which inserts the break node
  *      inside that same keydown.
@@ -23,18 +24,23 @@
  *    (for example a synthetic `beforeinput`) inserts a second line break, because
  *    Lexical commits the keydown-path DOM update after the dispatch returns.
  *
- * 2. Settings page ("Enter 换行"): three gestures, one select each, plus Save
- *    and Discard. Saving refuses a mapping with no line-break key and one where
- *    every key breaks the line, because either leaves the composer unusable.
- *    The page is a `settings.section` this plugin owns; the built-in "busy send"
- *    row belongs to ui-conversation and its copy cannot be replaced by another
- *    plugin, so the explanation lives here.
+ * 2. IME grace. DSH's composer keymap treats Enter as "still composing" for
+ *    10ms after `compositionend` (Safari delivers the closing keydown after
+ *    it). A replayed send inside that window would be swallowed, so a send
+ *    gesture seen there is deferred until the window has passed; a line-break
+ *    replay is dispatched immediately because the keymap checks Shift+Enter
+ *    before its IME guard.
  *
- *    Bindings persist in localStorage (`composer-enter-newline:bindings:v1`):
- *    a key map belongs to the browser that presses the keys, not to the shared
- *    settings document. The storage key, the locale namespace and the slot ids
- *    keep their original `composer-enter-newline` spelling on purpose: they are
- *    internal identities, so renaming them with the package would orphan saved
+ * 3. Settings page ("Enter 换行"): the effective mapping summary, the two
+ *    presets, the three gesture selects (plugin preset only), Save/Discard,
+ *    export/import of the saved configuration, and a runtime self-check.
+ *
+ *    Bindings persist in localStorage (`composer-enter-newline:bindings:v1`)
+ *    and the preset in `composer-enter-newline:preset`: a key map belongs to
+ *    the browser that presses the keys, not to the shared settings document.
+ *    The storage keys, the locale namespace and the slot ids keep their
+ *    original `composer-enter-newline` spelling on purpose: they are internal
+ *    identities, so renaming them with the package would orphan saved
  *    bindings and re-register dictionaries for no user-visible gain.
  */
 window.__ModuleLoader__.load({
@@ -44,10 +50,24 @@ window.__ModuleLoader__.load({
     const { useState } = React
     const h = React.createElement
 
+    /** Package name used in console diagnostics. */
+    const PLUGIN_NAME = 'dsh-enter-newline'
+    /** Single console prefix, so the plugin is easy to filter in DevTools. */
+    const LOG = `[${PLUGIN_NAME}]`
     /** The composer's Lexical contenteditable host (rendered with this marker). */
     const COMPOSER_SELECTOR = '[data-composer-input]'
-    /** The completion popups ("/" commands, "@" references) carry the listbox role. */
-    const MENU_SELECTOR = '[role="listbox"]'
+    /** The composer card that owns the editable surface and its overlays. */
+    const CARD_SELECTOR = '[data-composer-card]'
+    /** Completion popups ("/" commands, "@" references) carry this marker. */
+    const MENU_SELECTOR = '[data-trigger-menu]'
+    /** Older skins exposed the listbox through the input overlay. */
+    const OVERLAY_MENU_SELECTOR = '[data-composer-overlay] [role="listbox"]'
+    /** Fallback used only when the composer card is missing (DSH layout change). */
+    const FALLBACK_MENU_SELECTOR = '[data-trigger-menu], [role="listbox"]'
+    /** Any editable host, used by the "anchor missing" diagnostic. */
+    const EDITABLE_SELECTOR = '[contenteditable]'
+    /** Mirrors DSH's own `composingUntil = Date.now() + 10`, with a 2ms margin. */
+    const COMPOSITION_GRACE_MS = 12
     /** Replayed events, so the capture listener ignores its own dispatches. */
     const replayed = new WeakSet()
 
@@ -55,7 +75,9 @@ window.__ModuleLoader__.load({
 
     /** Storage key for the saved key map. */
     const STORAGE_KEY = 'composer-enter-newline:bindings:v1'
-    /** Actions a gesture can perform. */
+    /** Storage key for the selected preset ("plugin" | "dsh"). */
+    const PRESET_KEY = 'composer-enter-newline:preset'
+    /** Actions a gesture can perform in the plugin preset. */
     const ACTIONS = ['newline', 'steer', 'queue']
     /** Gestures the page configures, in display order. */
     const GESTURES = [
@@ -114,11 +136,42 @@ window.__ModuleLoader__.load({
       } catch {
         // Private mode or a disabled store: the mapping still applies this session.
       }
+      console.info(LOG, 'bindings saved', { ...bindings })
       return bindings
     }
 
     /** Live binding map the keydown listener reads. */
     let bindings = readBindings()
+
+    /**
+     * @returns the selected preset, defaulting to the plugin preset.
+     */
+    function readPreset() {
+      try {
+        return window.localStorage.getItem(PRESET_KEY) === 'dsh' ? 'dsh' : 'plugin'
+      } catch {
+        return 'plugin'
+      }
+    }
+
+    /**
+     * Switch presets; the change applies and persists immediately.
+     * @param next - "plugin" or "dsh".
+     * @returns the applied preset.
+     */
+    function writePreset(next) {
+      preset = next === 'dsh' ? 'dsh' : 'plugin'
+      try {
+        window.localStorage.setItem(PRESET_KEY, preset)
+      } catch {
+        // The preset still applies for this session.
+      }
+      console.info(LOG, 'preset', preset)
+      return preset
+    }
+
+    /** Live preset the keydown listener reads ("dsh" = leave everything native). */
+    let preset = readPreset()
 
     // --- composer key remap -------------------------------------------------
 
@@ -126,17 +179,27 @@ window.__ModuleLoader__.load({
     let conversationForm = null
 
     /**
-     * The behavior the composer gives plain Enter: its busy-send preference.
-     * @returns 'steer' or 'queue'; queue matches the shipped default.
+     * The busy-Enter preference DSH currently holds.
+     * @returns 'steer', 'queue', or undefined when unreadable.
      */
-    function preferredBusyBehavior() {
+    function readBusyEnter() {
       let value
       try {
         value = conversationForm?.getSnapshot()?.value
       } catch {
         value = undefined
       }
-      return value?.busyEnter === 'steer' ? 'steer' : 'queue'
+      if (value?.busyEnter === 'steer') return 'steer'
+      if (value?.busyEnter === 'queue') return 'queue'
+      return undefined
+    }
+
+    /**
+     * The behavior the composer gives plain Enter: its busy-send preference.
+     * @returns 'steer' or 'queue'; queue matches the shipped default.
+     */
+    function preferredBusyBehavior() {
+      return readBusyEnter() === 'steer' ? 'steer' : 'queue'
     }
 
     /**
@@ -149,13 +212,47 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * @returns whether a completion popup is visibly open.
+     * @returns whether the element is laid out (same check the menu uses).
+     * @param element - candidate menu or popup.
      */
-    function completionMenuOpen() {
-      for (const menu of document.querySelectorAll(MENU_SELECTOR)) {
-        if (menu.getClientRects().length > 0) return true
+    function isVisible(element) {
+      return element.getClientRects().length > 0
+    }
+
+    /**
+     * @returns whether a completion popup belonging to this composer is open.
+     * @param composer - the composer root that owns the gesture.
+     */
+    function completionMenuOpen(composer) {
+      const card = composer.closest(CARD_SELECTOR)
+      const scope = card ?? document
+      const selector = card === null ? FALLBACK_MENU_SELECTOR : `${MENU_SELECTOR}, ${OVERLAY_MENU_SELECTOR}`
+      for (const menu of scope.querySelectorAll(selector)) {
+        if (isVisible(menu)) return true
       }
       return false
+    }
+
+    /** Whether a composer has been seen, used by the settings-page self-check. */
+    let sawComposer = false
+    /** Whether the "anchor missing" warning was already emitted. */
+    let anchorWarningShown = false
+
+    /**
+     * Warn once when an editable composer card no longer owns a
+     * `[data-composer-input]` host, which means the selectors were renamed.
+     * @param target - the keydown target that missed the composer.
+     */
+    function warnMissingAnchor(target) {
+      if (anchorWarningShown || !(target instanceof Element)) return
+      if (target.closest(CARD_SELECTOR) === null) return
+      if (target.closest(EDITABLE_SELECTOR) === null) return
+      if (target.closest(COMPOSER_SELECTOR) !== null) return
+      anchorWarningShown = true
+      console.warn(
+        `${LOG} composer anchor missing: no ${COMPOSER_SELECTOR} host was found on a keydown in a composer card.`
+        + ' DSH may have changed; the remap is inactive for this composer.',
+      )
     }
 
     /**
@@ -190,7 +287,7 @@ window.__ModuleLoader__.load({
 
     /**
      * Replay an Enter keydown so the composer's submit gesture runs.
-     * @param event - the user's Enter keydown.
+     * @param event - the user's Enter keydown (only its repeat flag is used).
      * @param composer - the composer root that owns the gesture.
      * @param accelerated - true for the Ctrl/Cmd chord (the composer's opposite delivery mode).
      */
@@ -224,17 +321,74 @@ window.__ModuleLoader__.load({
       submitDraft(event, composer, preferredBusyBehavior() !== action)
     }
 
+    // --- IME composition grace ---------------------------------------------
+
+    /** True while a composition is running (set by the window listeners). */
+    let composing = false
+    /** Wall-clock end of DSH's post-composition guard window. */
+    let composingUntil = 0
+    /** Pending deferred send replay, cleared on dispose and on a newer key. */
+    let pendingReplay = null
+
+    /** A composition started; every Enter until it ends belongs to the IME. */
+    function onCompositionStart() {
+      composing = true
+    }
+
+    /** The composition ended; hold the send path for DSH's grace window. */
+    function onCompositionEnd() {
+      composing = false
+      composingUntil = Date.now() + COMPOSITION_GRACE_MS
+    }
+
+    /** Forget composition state (window blur, listener teardown). */
+    function resetComposition() {
+      composing = false
+      composingUntil = 0
+      if (pendingReplay !== null) {
+        clearTimeout(pendingReplay)
+        pendingReplay = null
+      }
+    }
+
+    /**
+     * Defers one send replay until DSH's post-composition window has passed.
+     * @param composer - the composer root that owns the gesture.
+     * @param action - 'steer' or 'queue'.
+     * @param repeat - the user's repeat flag.
+     * @param until - the end of the guard window (milliseconds).
+     */
+    function deferSend(composer, action, repeat, until) {
+      if (pendingReplay !== null) {
+        clearTimeout(pendingReplay)
+        pendingReplay = null
+      }
+      const wait = Math.max(4, until - Date.now() + 2)
+      pendingReplay = setTimeout(() => {
+        pendingReplay = null
+        if (!composer.isConnected) return
+        submitDraft({ repeat }, composer, preferredBusyBehavior() !== action)
+      }, wait)
+    }
+
     /**
      * @param event - any keydown seen on the window capture phase.
      */
     function onKeyDown(event) {
       if (replayed.has(event)) return
-      if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return
+      if (event.key !== 'Enter') return
       const composer = composerRoot(event.target)
-      if (composer === null) return
-      // An IME composition owns this Enter (candidate pick), and a read-only
-      // composer refuses input: let the composer handle both unchanged.
-      if (composer.hasAttribute('data-composer-composing') || !composer.isContentEditable) return
+      if (composer === null) {
+        warnMissingAnchor(event.target)
+        return
+      }
+      sawComposer = true
+      // The default preset leaves every gesture to DSH itself.
+      if (preset === 'dsh') return
+      // A real composition owns this Enter (candidate pick): let the IME have it.
+      if (composing || event.isComposing || event.keyCode === 229) return
+      // A read-only composer refuses input: leave it alone.
+      if (!composer.isContentEditable) return
       if (event.altKey) return
       if (typeof event.getModifierState === 'function' && event.getModifierState('AltGraph')) return
       // Both primary modifiers, or a primary modifier plus Shift, keep their
@@ -244,12 +398,19 @@ window.__ModuleLoader__.load({
       if (chord && event.shiftKey) return
       const gesture = chord ? 'ctrlEnter' : event.shiftKey ? 'shiftEnter' : 'enter'
       // An open completion menu owns Enter (pick the highlight), as before.
-      if (completionMenuOpen()) return
+      if (completionMenuOpen(composer)) return
       const action = bindings[gesture]
       // Shift+Enter mapped to a line break is already the composer's behavior.
       if (gesture === 'shiftEnter' && action === 'newline') return
       event.preventDefault()
       event.stopImmediatePropagation()
+      // A send replayed inside DSH's post-composition window would be swallowed
+      // by the composer's own IME guard; delay it. A line-break replay is safe:
+      // the composer's keymap handles Shift+Enter before its IME check.
+      if (action !== 'newline' && Date.now() < composingUntil) {
+        deferSend(composer, action, event.repeat, composingUntil)
+        return
+      }
       runAction(action, event, composer)
     }
 
@@ -262,30 +423,70 @@ window.__ModuleLoader__.load({
       zh: {
         'nav': 'Enter 换行',
         'page.title': 'Enter 换行',
-        'action.newline': '插入换行',
+        'action.newline': '换行',
         'action.steer': '插话发送',
         'action.queue': '排队发送',
         'select.aria': '{key} 按键行为',
+        'preset.title': '按键方案',
+        'preset.dsh': '默认配置',
+        'preset.dsh.desc': '热关闭插件，恢复当前DSH设置',
+        'preset.plugin': '插件配置',
+        'preset.plugin.desc': '用户自定义配置，可在下方逐键调整',
+        'status.plugin': '当前生效：Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = {shift}',
+        'status.dsh': '当前生效：Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = 换行',
+        'anchor.found': '输入框锚点：已检测到',
+        'anchor.missing': '输入框锚点：未检测到（DSH 可能改版，详见控制台）',
+        'anchor.unknown': '输入框锚点：尚未检测到（打开一个会话后回到此页可复查）',
+        'io.title': '导出 / 导入',
+        'io.export': '导出',
+        'io.copy': '复制',
+        'io.import': '导入',
+        'io.copied': '已复制',
+        'io.copyFailed': '复制失败，请手动全选复制',
+        'io.imported': '已导入',
+        'io.badJson': 'JSON 解析失败，请检查粘贴内容。',
+        'io.badFormat': '无法识别的格式：只支持 format 1。',
+        'io.badPlugin': '这不是本插件的配置（plugin 字段不匹配）。',
         'button.save': '保存',
+        'button.restoreDefault': '恢复插件预设',
         'button.discard': '放弃',
         'status.saved': '已保存',
-        'error.noNewline': '至少要有一个按键用于插入换行，否则草稿无法换行。',
-        'error.allNewline': '三个按键都设为插入换行，将无法用键盘发送草稿。',
-        'note': '插话与排队只在智能体运行时不同：插话立即进入当前回合，排队等本轮结束；空闲时两者都直接发送。补全菜单打开时 Enter 仍用于选中候选项，输入法组合中的 Enter 交给输入法。在 设置 → 插件 中禁用「Enter 换行」即可恢复原生行为。',
+        'error.noNewline': '至少要有一个按键用于换行，否则草稿无法换行。',
+        'error.allNewline': '三个按键都设为换行，将无法用键盘发送草稿。',
       },
       en: {
         'nav': 'Enter newline',
         'page.title': 'Enter newline',
-        'action.newline': 'Insert line break',
+        'action.newline': 'Line break',
         'action.steer': 'Steer',
         'action.queue': 'Queue',
         'select.aria': '{key} behavior',
+        'preset.title': 'Key scheme',
+        'preset.dsh': 'Default configuration',
+        'preset.dsh.desc': 'Disables the plugin on the spot and restores the current DSH settings',
+        'preset.plugin': 'Plugin configuration',
+        'preset.plugin.desc': 'User-defined configuration; adjust each key below',
+        'status.plugin': 'Active: Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = {shift}',
+        'status.dsh': 'Active: Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = line break',
+        'anchor.found': 'Composer anchor: detected',
+        'anchor.missing': 'Composer anchor: not detected (DSH may have changed; see the console)',
+        'anchor.unknown': 'Composer anchor: not detected yet (open a session and revisit this page)',
+        'io.title': 'Export / import',
+        'io.export': 'Export',
+        'io.copy': 'Copy',
+        'io.import': 'Import',
+        'io.copied': 'Copied',
+        'io.copyFailed': 'Copy failed; select the text and copy it manually',
+        'io.imported': 'Imported',
+        'io.badJson': 'Could not parse the JSON; check what you pasted.',
+        'io.badFormat': 'Unsupported format: only format 1 is accepted.',
+        'io.badPlugin': 'This is not this plugin\'s configuration (plugin field mismatch).',
         'button.save': 'Save',
+        'button.restoreDefault': 'Restore plugin default',
         'button.discard': 'Discard',
         'status.saved': 'Saved',
         'error.noNewline': 'At least one key must insert a line break, or the draft can never break a line.',
         'error.allNewline': 'All three keys insert a line break, so the draft could never be sent from the keyboard.',
-        'note': 'Steer and Queue differ only while an agent runs: Steer joins the running turn, Queue waits for it to finish, and both just send while idle. An open completion menu keeps Enter for picking items, and Enter inside an IME composition stays with the IME. Disable "Enter newline" under Settings → Plugins to restore the native behavior.',
       },
     }
 
@@ -324,8 +525,64 @@ window.__ModuleLoader__.load({
         lineHeight: '26px',
         color: 'var(--dsw-alias-label-primary)',
       },
-      rows: {
+      statusBox: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px',
         marginTop: '12px',
+        padding: '10px 12px',
+        borderRadius: 'var(--dsw-radius-md)',
+        background: 'var(--dsw-alias-bg-module-platform)',
+      },
+      statusText: {
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      sectionTitle: {
+        margin: '18px 0 0',
+        fontSize: '13px',
+        fontWeight: '600',
+        lineHeight: '20px',
+        color: 'var(--dsw-alias-label-primary)',
+      },
+      presetList: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px',
+        marginTop: '10px',
+      },
+      presetCard: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px',
+        width: '100%',
+        padding: '12px',
+        border: '0.5px solid var(--dsw-alias-border-l2)',
+        borderRadius: 'var(--dsw-radius-md)',
+        background: 'transparent',
+        color: 'inherit',
+        font: 'inherit',
+        textAlign: 'left',
+        cursor: 'pointer',
+      },
+      presetCardActive: {
+        borderColor: 'var(--dsw-alias-brand-primary-new-color, #4d6bfe)',
+        background: 'var(--dsw-alias-bg-module-platform)',
+      },
+      presetTitle: {
+        fontSize: '13px',
+        fontWeight: '600',
+        lineHeight: '20px',
+        color: 'var(--dsw-alias-label-primary)',
+      },
+      presetDesc: {
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      rows: {
+        marginTop: '6px',
       },
       row: {
         display: 'flex',
@@ -395,6 +652,21 @@ window.__ModuleLoader__.load({
         background: 'var(--dsw-alias-bg-module-platform)',
         color: 'var(--dsw-alias-label-primary)',
       },
+      secondaryDisabled: {
+        background: 'var(--dsw-alias-bg-module-platform)',
+        color: 'var(--dsw-alias-label-tertiary)',
+        cursor: 'default',
+      },
+      smallButton: {
+        height: '28px',
+        padding: '0 10px',
+        border: 'none',
+        borderRadius: 'var(--dsw-radius-md)',
+        font: 'inherit',
+        fontSize: '12px',
+        lineHeight: '18px',
+        cursor: 'pointer',
+      },
       primary: {
         background: 'var(--dsw-alias-brand-primary-new-colorprimary-new-color, #4d6bfe)',
         color: '#fff',
@@ -410,6 +682,50 @@ window.__ModuleLoader__.load({
         lineHeight: '18px',
         color: 'var(--dsw-alias-label-tertiary)',
       },
+      anchor: {
+        margin: '14px 0 0',
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-label-tertiary)',
+      },
+      textarea: {
+        width: '100%',
+        minHeight: '96px',
+        marginTop: '10px',
+        boxSizing: 'border-box',
+        padding: '8px',
+        resize: 'vertical',
+        border: '0.5px solid var(--dsw-alias-border-l2)',
+        borderRadius: 'var(--dsw-radius-md)',
+        background: 'var(--dsw-alias-bg-module-platform)',
+        color: 'var(--dsw-alias-label-primary)',
+        fontFamily: 'var(--ds-font-family-code)',
+        fontSize: '12px',
+        lineHeight: '18px',
+      },
+      ioButtons: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        marginTop: '8px',
+      },
+    }
+
+    /**
+     * One preset card: title, live description, selected state.
+     * @param props - preset copy and the selection handler.
+     * @returns the card button.
+     */
+    function PresetCard({ title, description, selected, onSelect }) {
+      return h('button', {
+        type: 'button',
+        role: 'radio',
+        'aria-checked': selected,
+        style: { ...STYLE.presetCard, ...(selected ? STYLE.presetCardActive : null) },
+        onClick: onSelect,
+      },
+        h('span', { style: STYLE.presetTitle }, title),
+        h('span', { style: STYLE.presetDesc }, description))
     }
 
     /**
@@ -429,17 +745,77 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The Settings page: three gesture selects, Save/Discard, and the save-time check.
+     * Build the portable export document from the saved configuration.
+     * @returns pretty-printed JSON.
+     */
+    function buildExportDocument() {
+      return JSON.stringify({ plugin: PLUGIN_NAME, format: 1, preset, bindings }, null, 2)
+    }
+
+    /**
+     * Parse an exported (or hand-written) configuration.
+     * @param text - JSON text from the textarea.
+     * @returns `{ bindings, preset? }`, or `{ error }` with a translation key.
+     */
+    function parseImportDocument(text) {
+      let raw
+      try {
+        raw = JSON.parse(text)
+      } catch {
+        return { error: 'io.badJson' }
+      }
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'io.badJson' }
+      if (raw.plugin !== undefined && raw.plugin !== PLUGIN_NAME) return { error: 'io.badPlugin' }
+      if (raw.format !== undefined && raw.format !== 1) return { error: 'io.badFormat' }
+      const envelope = raw.plugin !== undefined || raw.format !== undefined
+        || raw.preset !== undefined || raw.bindings !== undefined
+      const mapRaw = envelope ? raw.bindings : raw
+      if (mapRaw === null || typeof mapRaw !== 'object' || Array.isArray(mapRaw)) return { error: 'io.badJson' }
+      const next = normalizeBindings(mapRaw)
+      const refusal = validateBindings(next)
+      if (refusal !== null) return { error: refusal }
+      const nextPreset = raw.preset === 'dsh' || raw.preset === 'plugin' ? raw.preset : undefined
+      return { bindings: next, preset: nextPreset }
+    }
+
+    /**
+     * The Settings page: preset cards, the one-line effective summary, gesture
+     * selects, Restore plugin default / Discard / Save, self-check, and
+     * export/import.
      * @param props - slot props; `t` is bound to this plugin's namespace.
      * @returns the section content.
      */
     function SettingsPage({ t }) {
       const [draft, setDraft] = useState(() => ({ ...bindings }))
+      const [presetDraft, setPresetDraft] = useState(() => preset)
       const [error, setError] = useState('')
       const [saved, setSaved] = useState(false)
+      const [ioText, setIoText] = useState('')
+      const [ioStatus, setIoStatus] = useState('')
+      const [ioError, setIoError] = useState('')
+
+      // Every hook is declared above this line, so the order is stable.
       const options = ACTION_OPTIONS.map(option => ({ value: option.value, label: t(option.key) }))
-      // Saving is only meaningful while the draft differs from the live map.
       const dirty = !sameBindings(draft, bindings)
+      const busy = readBusyEnter()
+      const busyMode = busy ?? 'queue'
+      const dshEnter = t(busyMode === 'steer' ? 'action.steer' : 'action.queue')
+      const dshChord = t(busyMode === 'steer' ? 'action.queue' : 'action.steer')
+      const status = presetDraft === 'dsh'
+        ? t('status.dsh', { enter: dshEnter, ctrl: dshChord })
+        : t('status.plugin', {
+          enter: t(`action.${bindings.enter}`),
+          ctrl: t(`action.${bindings.ctrlEnter}`),
+          shift: t(`action.${bindings.shiftEnter}`),
+        })
+      // The draft and the live map both count: either one off the factory map
+      // means there is something to restore.
+      const atPluginDefault = sameBindings(draft, DEFAULT_BINDINGS) && sameBindings(bindings, DEFAULT_BINDINGS)
+      const anchorText = anchorWarningShown
+        ? t('anchor.missing')
+        : sawComposer || document.querySelectorAll(COMPOSER_SELECTOR).length > 0
+          ? t('anchor.found')
+          : t('anchor.unknown')
 
       const change = (gesture, value) => {
         setDraft(current => ({ ...current, [gesture]: value }))
@@ -451,6 +827,15 @@ window.__ModuleLoader__.load({
         setDraft({ ...bindings })
         setError('')
         setSaved(false)
+      }
+
+      const restoreDefault = () => {
+        writeBindings({ ...DEFAULT_BINDINGS })
+        setDraft({ ...bindings })
+        setError('')
+        setSaved(true)
+        setIoStatus('')
+        setIoError('')
       }
 
       const save = () => {
@@ -465,9 +850,72 @@ window.__ModuleLoader__.load({
         setSaved(true)
       }
 
+      const choosePreset = (next) => {
+        writePreset(next)
+        setPresetDraft(preset)
+        setError('')
+        setSaved(false)
+        setIoStatus('')
+        setIoError('')
+      }
+
+      const exportDoc = () => {
+        setIoText(buildExportDocument())
+        setIoStatus('')
+        setIoError('')
+      }
+
+      const copyDoc = () => {
+        const text = buildExportDocument()
+        setIoText(text)
+        const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
+        if (clipboard === undefined || typeof clipboard.writeText !== 'function') {
+          setIoError(t('io.copyFailed'))
+          setIoStatus('')
+          return
+        }
+        clipboard.writeText(text).then(
+          () => { setIoError(''); setIoStatus(t('io.copied')) },
+          () => { setIoError(t('io.copyFailed')); setIoStatus('') },
+        )
+      }
+
+      const importDoc = () => {
+        const result = parseImportDocument(ioText)
+        if (result.error !== undefined) {
+          setIoError(t(result.error))
+          setIoStatus('')
+          return
+        }
+        writeBindings(result.bindings)
+        if (result.preset !== undefined) writePreset(result.preset)
+        setDraft({ ...bindings })
+        setPresetDraft(preset)
+        setError('')
+        setSaved(false)
+        setIoError('')
+        setIoStatus(t('io.imported'))
+      }
+
       return h('div', { style: STYLE.page },
         h('h2', { style: STYLE.pageTitle }, t('page.title')),
-        h('div', { style: STYLE.rows },
+        h('div', { style: STYLE.statusBox, role: 'status' },
+          h('div', { style: STYLE.statusText }, status)),
+        h('div', { style: STYLE.sectionTitle }, t('preset.title')),
+        h('div', { style: STYLE.presetList, role: 'radiogroup', 'aria-label': t('preset.title') },
+          h(PresetCard, {
+            title: t('preset.dsh'),
+            description: t('preset.dsh.desc'),
+            selected: presetDraft === 'dsh',
+            onSelect: () => choosePreset('dsh'),
+          }),
+          h(PresetCard, {
+            title: t('preset.plugin'),
+            description: t('preset.plugin.desc'),
+            selected: presetDraft === 'plugin',
+            onSelect: () => choosePreset('plugin'),
+          })),
+        presetDraft === 'plugin' ? h('div', { style: STYLE.rows },
           GESTURES.map(gesture => h(GestureRow, {
             key: gesture.id,
             keyCap: gesture.keyCap,
@@ -475,10 +923,16 @@ window.__ModuleLoader__.load({
             label: t('select.aria', { key: gesture.keyCap }),
             options,
             onChange: (event) => { change(gesture.id, event.target.value) },
-          }))),
-        error === '' ? null : h('p', { style: STYLE.error, role: 'alert' }, error),
-        h('div', { style: STYLE.actions },
+          }))) : null,
+        presetDraft === 'plugin' && error !== '' ? h('p', { style: STYLE.error, role: 'alert' }, error) : null,
+        presetDraft === 'plugin' ? h('div', { style: STYLE.actions },
           saved && error === '' ? h('span', { style: STYLE.status, role: 'status' }, t('status.saved')) : null,
+          h('button', {
+            type: 'button',
+            style: { ...STYLE.button, ...(atPluginDefault ? STYLE.secondaryDisabled : STYLE.secondary) },
+            disabled: atPluginDefault,
+            onClick: restoreDefault,
+          }, t('button.restoreDefault')),
           h('button', {
             type: 'button',
             style: { ...STYLE.button, ...STYLE.secondary },
@@ -489,8 +943,38 @@ window.__ModuleLoader__.load({
             style: { ...STYLE.button, ...(dirty ? STYLE.primary : STYLE.primaryDisabled) },
             disabled: !dirty,
             onClick: save,
-          }, t('button.save'))),
-        h('p', { style: STYLE.note }, t('note')))
+          }, t('button.save'))) : null,
+        h('p', { style: STYLE.anchor }, anchorText),
+        h('div', { style: STYLE.sectionTitle }, t('io.title')),
+        h('textarea', {
+          style: STYLE.textarea,
+          value: ioText,
+          placeholder: 'JSON',
+          'aria-label': t('io.title'),
+          onChange: (event) => {
+            setIoText(event.target.value)
+            setIoStatus('')
+            setIoError('')
+          },
+        }),
+        h('div', { style: STYLE.ioButtons },
+          h('button', {
+            type: 'button',
+            style: { ...STYLE.smallButton, ...STYLE.secondary },
+            onClick: exportDoc,
+          }, t('io.export')),
+          h('button', {
+            type: 'button',
+            style: { ...STYLE.smallButton, ...STYLE.secondary },
+            onClick: copyDoc,
+          }, t('io.copy')),
+          h('button', {
+            type: 'button',
+            style: { ...STYLE.smallButton, ...STYLE.secondary },
+            onClick: importDoc,
+          }, t('io.import')),
+          ioStatus === '' ? null : h('span', { style: STYLE.status, role: 'status' }, ioStatus)),
+        ioError === '' ? null : h('p', { style: STYLE.error }, ioError))
     }
 
     /**
@@ -519,11 +1003,25 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       // Exposed for the bundled check (`npm test`); nothing in DSH reads it.
-      __test: { DEFAULT_BINDINGS, GESTURES, normalizeBindings, validateBindings },
+      __test: {
+        DEFAULT_BINDINGS, GESTURES, PRESET_KEY, STORAGE_KEY,
+        normalizeBindings, sameBindings, validateBindings,
+        buildExportDocument, parseImportDocument,
+      },
       apply(ctx) {
         ctx.effect(() => {
+          const onBlur = () => { resetComposition() }
           window.addEventListener('keydown', onKeyDown, true)
-          return () => { window.removeEventListener('keydown', onKeyDown, true) }
+          window.addEventListener('compositionstart', onCompositionStart, true)
+          window.addEventListener('compositionend', onCompositionEnd, true)
+          window.addEventListener('blur', onBlur)
+          return () => {
+            window.removeEventListener('keydown', onKeyDown, true)
+            window.removeEventListener('compositionstart', onCompositionStart, true)
+            window.removeEventListener('compositionend', onCompositionEnd, true)
+            window.removeEventListener('blur', onBlur)
+            resetComposition()
+          }
         }, 'composer-enter-newline: composer keydown remap')
 
         // The busy-send preference decides which gesture carries which mode;
@@ -540,6 +1038,8 @@ window.__ModuleLoader__.load({
 
         ctx.effect(() => ctx.locale.register(NS, DICT), 'composer-enter-newline: dictionaries')
         const t = ctx.locale.bind(NS)
+
+        console.info(LOG, 'active', { preset, bindings: { ...bindings } })
 
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
