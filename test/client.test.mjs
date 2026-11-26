@@ -34,6 +34,21 @@ class FakeElement {
   get isConnected() {
     return this.connected
   }
+
+  /** No attributes unless a stub overrides this (menus read the highlight here). */
+  getAttribute() {
+    return null
+  }
+
+  /** Only the popup listbox claims a role; everything else matches nothing. */
+  matches() {
+    return false
+  }
+
+  /** No children unless a stub overrides this. */
+  querySelectorAll() {
+    return []
+  }
 }
 
 class FakeKeyboardEvent {
@@ -60,6 +75,7 @@ const fakeDocument = {
 }
 
 let listeners = []
+const disposers = []
 const fakeWindow = {
   __ModuleLoader__: {
     load(registration) { fakeWindow.registration = registration },
@@ -99,6 +115,7 @@ const createPlugin = () => registration.factory(name => {
 
 const mount = ({ bindings, preset, busyEnter } = {}) => {
   listeners = []
+  disposers.length = 0
   hooks.index = 0
   hooks.store.length = 0
   fakeDocument.composers = []
@@ -115,7 +132,10 @@ const mount = ({ bindings, preset, busyEnter } = {}) => {
     getSnapshot: () => ({ value: busyEnter === undefined ? undefined : { busyEnter } }),
   }
   const ctx = {
-    effect(fn) { const dispose = fn(); if (typeof dispose === 'function') dispose() },
+    // Keep the disposers instead of running them at once: the real ctx.effect()
+    // returns a teardown that DSH calls on disable/reload, and one test below
+    // exercises that teardown (the diagnostics API must disappear with it).
+    effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose) },
     inject(deps, callback) {
       if (!deps.includes('configForms')) return
       callback({
@@ -144,7 +164,18 @@ const mount = ({ bindings, preset, busyEnter } = {}) => {
     },
   }
   plugin.apply(ctx)
-  return { plugin, registrations, dictionaries }
+  return { plugin, registrations, dictionaries, disposers }
+}
+
+/** One popup: a shell that contains a listbox carrying (or not) the highlight. */
+const makeMenu = ({ highlight = false } = {}) => {
+  const listbox = Object.assign(new FakeElement(), {
+    matches: selector => selector === '[role="listbox"]',
+    getAttribute: name => (name === 'aria-activedescendant' && highlight ? 'dsh-slash-option-commands-0' : null),
+  })
+  return Object.assign(new FakeElement(), {
+    querySelectorAll: selector => (selector === '[role="listbox"]' ? [listbox] : []),
+  })
 }
 
 const makeCard = (menus = []) => ({
@@ -246,12 +277,14 @@ assert.deepEqual(Object.keys(zh).sort(), [
   'action.newline', 'action.queue', 'action.steer',
   'anchor.found', 'anchor.missing', 'anchor.unknown',
   'button.discard', 'button.restoreDefault', 'button.save',
+  'diagnostics.copy',
   'error.allNewline', 'error.noNewline',
   'io.badFormat', 'io.badJson', 'io.badPlugin', 'io.copy', 'io.copyFailed', 'io.copied',
   'io.export', 'io.import', 'io.imported', 'io.title',
   'nav', 'page.title',
   'preset.dsh', 'preset.dsh.desc', 'preset.plugin', 'preset.plugin.desc', 'preset.title',
   'select.aria', 'status.dsh', 'status.plugin', 'status.saved',
+  'storage.volatile',
 ].sort())
 assert.equal(zh['action.newline'], '换行', 'the action is called 换行, not 插入换行')
 assert.equal(zh['nav'], 'Enter 换行')
@@ -318,7 +351,7 @@ for (const init of [{}, { ctrlKey: true }, { shiftKey: true }]) {
   assert.equal(replay, undefined, 'default preset dispatches nothing')
 }
 
-// --- menu scoping ----------------------------------------------------------
+// --- menu arbitration (three states) ---------------------------------------
 // A visible listbox elsewhere on the page no longer disables the composer.
 mount()
 const ownCard = makeCard()
@@ -328,11 +361,53 @@ fakeDocument.menus = [new FakeElement()]
 assert.ok(event.defaultPrevented, 'a listbox outside the composer card does not block the keys')
 assert.equal(replay.shiftKey, true)
 
-// The composer's own completion menu still owns Enter.
-ownCard.querySelectorAll = () => [new FakeElement()]
+// A highlight means the popup owns Enter: the key passes through untouched.
+ownCard.querySelectorAll = () => [makeMenu({ highlight: true })]
 ;({ event, replay } = press(scoped))
-assert.ok(!event.defaultPrevented, 'the composer card menu keeps Enter')
+assert.ok(!event.defaultPrevented, 'a highlighted candidate keeps Enter')
 assert.equal(replay, undefined)
+
+// A popup without a highlight would fall through to DSH's submit, so the
+// plugin swallows the gesture: no send, no line break.
+ownCard.querySelectorAll = () => [makeMenu()]
+;({ event, replay } = press(scoped))
+assert.ok(event.defaultPrevented, 'a popup without a highlight swallows Enter')
+assert.ok(event.propagationStopped, 'the swallowed Enter never reaches the composer keymap')
+assert.equal(replay, undefined, 'nothing is replayed while the popup has no highlight')
+
+// The same popup state swallows the accelerated send chord too.
+;({ event, replay } = press(scoped, { ctrlKey: true }))
+assert.ok(event.defaultPrevented, 'a popup without a highlight swallows Ctrl+Enter')
+assert.equal(replay, undefined)
+
+// Shift+Enter never sends, so it keeps the native line break.
+;({ event, replay } = press(scoped, { shiftKey: true }))
+assert.ok(!event.defaultPrevented, 'Shift+Enter keeps the native line break in a highlight-less popup')
+assert.equal(replay, undefined)
+
+// Highlight appearing later flips the decision back to "popup owns it".
+ownCard.querySelectorAll = () => [makeMenu({ highlight: true })]
+;({ event, replay } = press(scoped))
+assert.ok(!event.defaultPrevented, 'the highlight state is read per keystroke')
+
+// A skin that exposes the listbox itself as the popup is read directly.
+const directListbox = Object.assign(new FakeElement(), {
+  matches: selector => selector === '[role="listbox"]',
+  getAttribute: name => (name === 'aria-activedescendant' ? 'dsh-slash-option-commands-0' : null),
+})
+ownCard.querySelectorAll = () => [directListbox]
+;({ event, replay } = press(scoped))
+assert.ok(!event.defaultPrevented, 'a bare listbox with a highlight keeps Enter')
+directListbox.getAttribute = () => null
+;({ event } = press(scoped))
+assert.ok(event.defaultPrevented, 'a bare listbox without a highlight swallows Enter')
+
+// The block decision is observable through the diagnostics API.
+ownCard.querySelectorAll = () => [makeMenu()]
+press(scoped)
+let api = fakeWindow.__dshEnterNewline
+assert.equal(api.getStatus().lastKey.decision, 'menu-blocked')
+assert.ok(api.getStatus().menuBlocks >= 1, 'swallowed menu gestures are counted')
 
 // Without a card (layout change) the old page-wide fallback survives.
 mount()
@@ -367,10 +442,61 @@ fire('compositionend')
 ;({ replay } = press(lineComposer))
 assert.equal(replay?.shiftKey, true, 'a line break is replayed immediately after compositionend')
 
-// --- anchor diagnostic ------------------------------------------------------
+// --- diagnostics API --------------------------------------------------------
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+mount()
+api = fakeWindow.__dshEnterNewline
+assert.ok(api, 'apply installs window.__dshEnterNewline')
+assert.equal(api.version, pkg.version, 'the API version matches package.json')
+assert.equal(first.plugin.__test.VERSION, pkg.version, 'the bundled VERSION constant matches package.json')
+assert.deepEqual(Object.keys(api.getStatus()).sort(), [
+  'anchor', 'bindings', 'busyEnter', 'composers', 'lastKey',
+  'menuBlocks', 'plugin', 'preset', 'storage', 'version',
+])
+assert.equal(api.getStatus().preset, 'plugin')
+assert.equal(api.getStatus().busyEnter, 'unknown', 'no settings service means unknown')
+// Every mount is a fresh factory closure, so nothing has been seen yet.
+assert.equal(api.getStatus().anchor, 'unknown')
+assert.equal(api.getStatus().lastKey, null)
+assert.equal(api.getStatus().storage, 'local')
+
+// The binding copy must not be a live reference.
+const copy = api.getBindings()
+copy.enter = 'steer'
+assert.equal(api.getBindings().enter, 'newline', 'getBindings returns a snapshot')
+assert.ok(api.inspect().includes('"version"'))
+assert.equal(JSON.parse(api.inspect()).plugin, 'dsh-enter-newline')
+
+// Every exit records its decision for the shared bug-report snapshot.
+press(makeComposer())
+assert.equal(api.getStatus().anchor, 'found', 'a composer press marks the anchor as found')
+assert.equal(api.getStatus().lastKey.decision, 'newline', 'a line break replay is recorded')
+assert.equal(api.getStatus().lastKey.gesture, 'enter')
+press(makeComposer(), { ctrlKey: true })
+assert.equal(api.getStatus().lastKey.decision, 'steer')
+press(makeComposer(), { shiftKey: true })
+assert.equal(api.getStatus().lastKey.decision, 'queue')
+press(makeComposer(), { altKey: true })
+assert.equal(api.getStatus().lastKey.decision, 'reserved', 'Alt+Enter is left to the composer')
+assert.equal(api.getStatus().lastKey.gesture, null, 'a reserved chord records no gesture')
+press(makeComposer({ editable: false }))
+assert.equal(api.getStatus().lastKey.decision, 'readonly')
+assert.equal(api.getStatus().composers, 0, 'no composer in the stub document')
+mount({ preset: 'dsh' })
+press(makeComposer())
+assert.equal(fakeWindow.__dshEnterNewline.getStatus().lastKey.decision, 'preset-dsh')
+
+// Disabling the plugin removes the API again.
+const disposed = mount()
+assert.ok(fakeWindow.__dshEnterNewline, 'the API is installed by apply')
+for (const fn of [...disposed.disposers].reverse()) fn()
+assert.equal(fakeWindow.__dshEnterNewline, undefined, 'dispose removes the API')
+
+// --- anchor diagnostic and fail-safe --------------------------------------
 mount()
 const editableCard = makeCard()
 const editableTarget = Object.assign(new FakeElement(), {
+  isContentEditable: true,
   closest(selector) {
     if (selector === '[data-composer-card]') return editableCard
     if (selector === '[contenteditable]') return editableTarget
@@ -383,6 +509,54 @@ assert.equal(logs.warn.length, 1, 'a missing anchor warns once')
 assert.ok(String(logs.warn[0][0]).includes('composer anchor missing'))
 press(makeComposer(), {}, editableTarget)
 assert.equal(logs.warn.length, 1, 'the anchor warning is not repeated')
+
+// Fail safe: with the anchor gone, a send must never reach the host.
+const missingPress = (init = {}, target = editableTarget) => {
+  const ev = new FakeKeyboardEvent('keydown', { key: 'Enter', keyCode: 13, target, ...init })
+  for (const listener of listeners.filter(l => l.type === 'keydown')) listener.fn(ev)
+  return ev
+}
+let missing = missingPress()
+assert.ok(missing.defaultPrevented, 'a send Enter on a renamed anchor is swallowed')
+assert.ok(missing.propagationStopped, 'and never reaches the host keymap')
+missing = missingPress({ ctrlKey: true })
+assert.ok(missing.defaultPrevented, 'the accelerated send is swallowed as well')
+missing = missingPress({ shiftKey: true })
+assert.ok(!missing.defaultPrevented, 'Shift+Enter keeps the native line break')
+missing = missingPress({ altKey: true })
+assert.ok(!missing.defaultPrevented, 'Alt+Enter stays with the composer')
+
+// A non-editable card target (workspace trigger) is not touched.
+const readonlyTarget = Object.assign(new FakeElement(), {
+  isContentEditable: false,
+  closest(selector) {
+    if (selector === '[data-composer-card]') return editableCard
+    if (selector === '[contenteditable]') return readonlyTarget
+    return null
+  },
+})
+missing = missingPress({}, readonlyTarget)
+assert.ok(!missing.defaultPrevented, 'a read-only card does not swallow Enter')
+
+// Outside a composer card nothing is swallowed.
+const outsideTarget = Object.assign(new FakeElement(), {
+  isContentEditable: true,
+  closest: () => null,
+})
+missing = missingPress({}, outsideTarget)
+assert.ok(!missing.defaultPrevented, 'an editable outside a composer card is left alone')
+
+// A highlighted popup inside the missing-anchor card still owns Enter.
+editableCard.querySelectorAll = () => [makeMenu({ highlight: true })]
+missing = missingPress()
+assert.ok(!missing.defaultPrevented, 'the popup highlight wins even on a renamed anchor')
+editableCard.querySelectorAll = () => []
+
+// The default preset never intervenes, even with a missing anchor.
+mount({ preset: 'dsh' })
+missing = missingPress()
+assert.ok(!missing.defaultPrevented, 'the default preset does not swallow anything')
+assert.equal(fakeWindow.__dshEnterNewline.getStatus().anchor, 'missing', 'the status reports the broken anchor')
 
 // --- settings page harness -------------------------------------------------
 const mountPage = (options) => {
@@ -594,6 +768,17 @@ button(tree, '复制').props.onClick()
 tree = suite.render()
 assert.ok(textOf(tree).includes(dict['io.copyFailed']), 'copy failure is surfaced')
 
+// --- copy diagnostics ------------------------------------------------------
+suite = mountPage()
+tree = suite.render()
+dict = suite.dict
+button(tree, '复制诊断').props.onClick()
+tree = suite.render()
+const diagnostic = JSON.parse(elementsOf(tree, 'textarea')[0].props.value)
+assert.equal(diagnostic.plugin, 'dsh-enter-newline', 'the diagnostics button writes the status JSON')
+assert.equal(diagnostic.version, pkg.version)
+assert.ok(textOf(tree).includes(dict['io.copyFailed']), 'no clipboard: the JSON lands in the box for manual copy')
+
 // --- parse/build helpers ---------------------------------------------------
 assert.deepEqual(first.plugin.__test.parseImportDocument('null'), { error: 'io.badJson' })
 assert.deepEqual(first.plugin.__test.parseImportDocument('[]'), { error: 'io.badJson' })
@@ -604,5 +789,26 @@ assert.equal(first.plugin.__test.buildExportDocument().includes('"plugin": "dsh-
 const iconTree = icon.component({ size: 20, active: true })
 assert.equal(iconTree.props.width, 20)
 assert.equal(iconTree.props.stroke, 'currentColor')
+
+// --- storage failure is reported, not swallowed ----------------------------
+// Runs last: a failed write keeps the page in "this session only" mode for the
+// rest of the session, exactly like the real plugin.
+mountPage()
+const realSetItem = fakeWindow.localStorage.setItem
+fakeWindow.localStorage.setItem = () => { throw new Error('quota exceeded') }
+suite = mountPage()
+tree = suite.render()
+dict = suite.dict
+selects(tree)[2].props.onChange({ target: { value: 'newline' } })
+tree = suite.render()
+button(tree, '保存').props.onClick()
+tree = suite.render()
+assert.ok(textOf(tree).includes(dict['storage.volatile']), 'a failed write is surfaced on the page')
+assert.equal(fakeWindow.__dshEnterNewline.getStatus().storage, 'volatile', 'the API reports the volatile store')
+assert.ok(
+  logs.warn.some(args => String(args[1] ?? '').includes('localStorage write failed')),
+  'the failure is logged once',
+)
+fakeWindow.localStorage.setItem = realSetItem
 
 console.log('client.js harness: all assertions passed')

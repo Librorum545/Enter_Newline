@@ -69,7 +69,9 @@ DSH 内置的「繁忙时的发送行为」说明文字（`设置 → 通用`）
 
 **输入法结束后的 10ms 宽限**：DSH 自己的 keymap 在 `compositionend` 之后还会把 Enter 当作组合中处理（Safari 会在 `compositionend` 之后才发 closing keydown）。插件监听组合事件，在这 12ms 窗口内把「发送类」重放推迟到窗口结束再派发（换行重放不受影响，因为 composer 先判断 Shift+Enter）。这样中文选词确认后立刻按发送不会丢键。
 
-**补全菜单的判定收敛到当前 composer**：只检查 `[data-composer-card]` 内可见的 `[data-trigger-menu]`（以及旧的 `[data-composer-overlay] [role="listbox"]`）。页面别处出现可见的 listbox 不再让当前输入框的三个键失效；找不到 composer 卡片时退回文档级判定。
+**补全菜单的判定分三态**：只检查 `[data-composer-card]` 内可见的 `[data-trigger-menu]`（以及旧的 `[data-composer-overlay] [role="listbox"]`）。菜单里有高亮候选（listbox 带 `aria-activedescendant`）时 Enter 归菜单；菜单可见但**没有**高亮候选时，DSH 会把 Enter 判成提交，所以插件直接把 Enter 吞掉（不发、不换行）；没有菜单时才按映射执行。页面别处出现可见的 listbox 不再让当前输入框的三个键失效；找不到 composer 卡片时退回文档级判定。
+
+**锚点失效时失败安全**：`[data-composer-input]` 不存在时（DSH 改版），插件只告警一次，并在“输入框卡片内的可编辑块”上吞掉发送类 Enter（含 Ctrl/Cmd+Enter），不再退回宿主的发送路径；Shift+Enter 仍由宿主换行。宁可“回车没反应”，也不把半截草稿发出去。
 
 设置页走 Client 的 `settings.section` 与 `settings.section.icon` 槽位：分区页由插件注册（`order: 5`，紧跟「通用设置」），导航图标与分区同 id，文案注册在插件自己的 locale 命名空间里，切换语言时整页跟随。
 
@@ -77,10 +79,38 @@ DSH 内置的「繁忙时的发送行为」说明文字（`设置 → 通用`）
 
 - 输入法组合中的 Enter 不拦截，由输入法选中候选词。
 - 草稿只读（发送中、会话不可用）时不拦截。
-- 补全菜单打开时 Enter 归菜单，三种手势都暂时不生效。
+- 补全菜单打开时 Enter 归菜单：有高亮候选就选中它；**菜单可见但没有高亮候选时 Enter 被吞掉**（不发、不换行），先 Esc 关菜单或选中候选再换行。Shift+Enter 不受影响，仍由宿主换行。
 - 命令 chip 阶段（`/命令` 已选中、`data-phase="claimed"`）仍按映射执行：插件配置下 Enter 仍然换行，提交命令请用 Ctrl/Cmd+Enter 或发送按钮。
 - 同一页面内的所有 composer（含右侧边栏的子智能体会话）都生效。
 - 只改前端按键映射，不改变 Host 的投递语义。
+
+## 诊断
+
+插件启用期间暴露一个只读的诊断入口（与 `window.__dshMobileKeys` 同一风格）：
+
+```js
+window.__dshEnterNewline.getStatus()      // 当前状态快照
+window.__dshEnterNewline.getBindings()    // 当前三键映射
+window.__dshEnterNewline.inspect()        // 快照的格式化 JSON
+```
+
+`getStatus()` 返回：
+
+| 字段 | 说明 |
+|---|---|
+| `version` | 插件版本（与 `package.json` 一致） |
+| `preset` | `plugin`（插件配置）或 `dsh`（默认配置） |
+| `bindings` | `{ enter, ctrlEnter, shiftEnter }` 当前映射 |
+| `busyEnter` | `ui-conversation` 的「繁忙时 Enter」：`steer` / `queue` / `unknown` |
+| `anchor` | `found` / `missing` / `unknown`：是否还找得到 `[data-composer-input]` |
+| `composers` | 页面上当前匹配到的 composer 数量 |
+| `lastKey` | 最近一次 Enter 的 `{ at, gesture, decision }`，`decision` 说明这次为什么换行/为什么让路/为什么被吞 |
+| `menuBlocks` | 被“菜单无高亮”吞掉的次数 |
+| `storage` | `local`（已持久化）或 `volatile`（浏览器存储不可用，仅本次会话） |
+
+`lastKey.decision` 取值：`preset-dsh`、`composing`、`readonly`、`reserved`、`menu-pick`、`menu-blocked`、`newline`、`native-newline`、`steer`、`queue`、`ime-deferred`、`anchor-missing-blocked`。
+
+设置页锚点那一行右侧有「复制诊断」：把 `inspect()` 的结果复制到剪贴板，提 issue 时直接粘贴即可；剪贴板不可用时会把这段落进下方的导出文本框，手动全选复制。
 
 ## 关闭与移除
 
@@ -95,12 +125,13 @@ DSH 内置的「繁忙时的发送行为」说明文字（`设置 → 通用`）
 
 ## 已知限制
 
-- 依赖 composer 的 `[data-composer-input]`、卡片的 `[data-composer-card]` 与菜单的 `[data-trigger-menu]`；DSH 改版后需要同步更新（设置页的锚点自检 + 控制台告警会提示）。
+- 依赖 composer 的 `[data-composer-input]`、卡片的 `[data-composer-card]` 与菜单的 `[data-trigger-menu]`；DSH 改版后需要同步更新（设置页的锚点自检 + `getStatus().anchor` 会提示）。锚点失效时会退化为“只告警 + 吞掉发送”，不会把半截草稿发出去。
 - 重放的是合成键盘事件（`isTrusted=false`）。DSH 目前不检查这个标记；插件用 `WeakSet` 忽略自己派发的事件，不会自激。
 - 「插话/排队」依赖读取 `ui-conversation` 的 `busyEnter`；读不到时按 `queue` 处理。
 - 会话不支持插话时，「插话发送」由 composer 自行退化为排队，与 DSH 原生行为一致。
 - 输入框为空、且队列里已有消息时，走 Ctrl/Cmd 通道的动作按 DSH 原生语义变成「插话全部排队消息」。
-- 按键映射与配置存在浏览器本地，不同浏览器/不同机器需要各自设置；1.3.0 提供导出/导入用于迁移。
+- 按键映射与配置存在浏览器本地，不同浏览器/不同机器需要各自设置；1.3.0 起提供导出/导入用于迁移。
+- 浏览器存储不可用时（隐私模式、配额满）设置只对本次会话生效：设置页会明确提示，`getStatus().storage` 显示 `volatile`。
 - 内置的「繁忙时的发送行为」说明文字由 `ui-conversation` 拥有，插件无法替换（同一 locale 命名空间与语言只允许一个所有者）；想改那段文字只能走 DSH 上游。
 - 浏览器半件由 client-hmr 热加载（见「热加载」）；Host 半件与插件行的增删仍需要重启桌面端。
 
@@ -111,12 +142,14 @@ DSH 内置的「繁忙时的发送行为」说明文字（`设置 → 通用`）
 - 默认映射、已保存映射、`busyEnter` 变化时手势的翻转；
 - 默认配置完全不拦截；
 - 输入法组合与结束后 12ms 窗口内发送重放的延迟、换行重放的即时性；
-- 补全菜单收敛（卡片内菜单让路、页面别处的 listbox 不再影响）；
-- 锚点缺失告警只出现一次；
+- 补全菜单三态（有高亮让路、无高亮吞键、页面别处的 listbox 不影响、卡片消失后的兜底）；
+- 锚点缺失只告警一次，以及失败安全吞键、只读/Alt/Composition/菜单高亮的豁免；
+- 诊断 API（安装、字段、映射副本、`lastKey` 决策、禁用后移除、版本与 `package.json` 一致）与设置页「复制诊断」；
 - 设置页两张配置卡、一行状态摘要、锚点显示；
 - 三键下拉与保存校验、保存按钮脏/净状态、恢复插件预设、放弃恢复；
 - 配置切换立即写盘并立即生效；
 - 导出内容、导入（信封/裸映射/非法 JSON/错误格式/错误插件/非法映射）、导入成功后的存储与生效；
+- 浏览器存储写入失败时页面明确提示且不谎报“已保存”；
 - 中英文案键齐全且「换行」文案统一。
 
 ## 许可证

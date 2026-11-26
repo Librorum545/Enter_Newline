@@ -24,6 +24,14 @@
  *    (for example a synthetic `beforeinput`) inserts a second line break, because
  *    Lexical commits the keydown-path DOM update after the dispatch returns.
  *
+ *    The completion popup is arbitrated in three states instead of "visible or
+ *    not": a highlight lets the popup keep Enter, a popup with no highlight
+ *    swallows it (DSH would otherwise answer "pass" and submit the draft), and
+ *    no popup means the mapping applies. The failure direction is deliberate:
+ *    "Enter does nothing" is always better than "half a draft was sent", so a
+ *    renamed composer anchor also swallows send gestures instead of falling
+ *    back to the host's send path.
+ *
  * 2. IME grace. DSH's composer keymap treats Enter as "still composing" for
  *    10ms after `compositionend` (Safari delivers the closing keydown after
  *    it). A replayed send inside that window would be swallowed, so a send
@@ -31,7 +39,12 @@
  *    replay is dispatched immediately because the keymap checks Shift+Enter
  *    before its IME guard.
  *
- * 3. Settings page ("Enter 换行"): the effective mapping summary, the two
+ * 3. Diagnostics: `window.__dshEnterNewline.getStatus()` reports the live
+ *    preset, bindings, busy-Enter value, anchor state and the last decision the
+ *    keydown handler took; `inspect()` returns it as JSON. The Settings page
+ *    copies it, so a report can be attached to a bug without reading DevTools.
+ *
+ * 4. Settings page ("Enter 换行"): the effective mapping summary, the two
  *    presets, the three gesture selects (plugin preset only), Save/Discard,
  *    export/import of the saved configuration, and a runtime self-check.
  *
@@ -66,6 +79,12 @@ window.__ModuleLoader__.load({
     const FALLBACK_MENU_SELECTOR = '[data-trigger-menu], [role="listbox"]'
     /** Any editable host, used by the "anchor missing" diagnostic. */
     const EDITABLE_SELECTOR = '[contenteditable]'
+    /** The popup listbox that carries the keyboard highlight. */
+    const LISTBOX_SELECTOR = '[role="listbox"]'
+    /** The highlight reaches the DOM only through this attribute. */
+    const HIGHLIGHT_ATTR = 'aria-activedescendant'
+    /** Package version exposed by the diagnostics API (`npm test` keeps it honest). */
+    const VERSION = '1.3.1'
     /** Mirrors DSH's own `composingUntil = Date.now() + 10`, with a 2ms margin. */
     const COMPOSITION_GRACE_MS = 12
     /** Replayed events, so the capture listener ignores its own dispatches. */
@@ -124,6 +143,27 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Whether a write failed at least once (surfaced by the page and the API). */
+    let storageFailed = false
+
+    /**
+     * Persist one value, remembering a failure so the page can say
+     * "this session only" instead of a false "Saved".
+     * @param key - the storage key.
+     * @param value - the serialized value.
+     * @returns whether the value reached the store.
+     */
+    function persist(key, value) {
+      try {
+        window.localStorage.setItem(key, value)
+        return true
+      } catch {
+        storageFailed = true
+        console.warn(LOG, 'localStorage write failed; the setting only applies to this session')
+        return false
+      }
+    }
+
     /**
      * Persist a binding map and make it live for the next keystroke.
      * @param next - the map to save.
@@ -131,12 +171,8 @@ window.__ModuleLoader__.load({
      */
     function writeBindings(next) {
       bindings = normalizeBindings(next)
-      try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(bindings))
-      } catch {
-        // Private mode or a disabled store: the mapping still applies this session.
-      }
-      console.info(LOG, 'bindings saved', { ...bindings })
+      const stored = persist(STORAGE_KEY, JSON.stringify(bindings))
+      console.info(LOG, stored ? 'bindings saved' : 'bindings saved (not persisted)', { ...bindings })
       return bindings
     }
 
@@ -161,11 +197,7 @@ window.__ModuleLoader__.load({
      */
     function writePreset(next) {
       preset = next === 'dsh' ? 'dsh' : 'plugin'
-      try {
-        window.localStorage.setItem(PRESET_KEY, preset)
-      } catch {
-        // The preset still applies for this session.
-      }
+      persist(PRESET_KEY, preset)
       console.info(LOG, 'preset', preset)
       return preset
     }
@@ -220,23 +252,83 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * @returns whether a completion popup belonging to this composer is open.
-     * @param composer - the composer root that owns the gesture.
+     * Arbitrate the completion popup for this composer.
+     * @param scope - the composer card, or the document in the no-card fallback.
+     * @param card - the composer card, or null when the layout has no card.
+     * @returns 'pick' when a highlight exists (the popup owns Enter), 'block'
+     *   when the popup is open without one (Enter must not reach the submit
+     *   gesture), or 'none'.
      */
-    function completionMenuOpen(composer) {
-      const card = composer.closest(CARD_SELECTOR)
-      const scope = card ?? document
+    function menuState(scope, card) {
       const selector = card === null ? FALLBACK_MENU_SELECTOR : `${MENU_SELECTOR}, ${OVERLAY_MENU_SELECTOR}`
+      const menus = []
       for (const menu of scope.querySelectorAll(selector)) {
-        if (isVisible(menu)) return true
+        if (isVisible(menu)) menus.push(menu)
       }
-      return false
+      if (menus.length === 0) return 'none'
+      // Without a card a page-wide popup cannot be attributed to this composer,
+      // so the old "any visible popup wins" behaviour stays (it never blocks).
+      if (card === null) return 'pick'
+      for (const menu of menus) {
+        const listboxes = typeof menu.matches === 'function' && menu.matches(LISTBOX_SELECTOR)
+          ? [menu]
+          : [...menu.querySelectorAll(LISTBOX_SELECTOR)]
+        for (const listbox of listboxes) {
+          if ((listbox.getAttribute(HIGHLIGHT_ATTR) ?? '') !== '') return 'pick'
+        }
+        // A skin that carries the highlight on the popup shell itself.
+        if ((menu.getAttribute(HIGHLIGHT_ATTR) ?? '') !== '') return 'pick'
+      }
+      return 'block'
+    }
+
+    /**
+     * Classify the Enter a keydown carries.
+     * @param event - the keydown event.
+     * @returns 'enter' | 'ctrlEnter' | 'shiftEnter', or null for a gesture the
+     *   composer keeps for itself (Alt, AltGraph, both primaries, chord+Shift).
+     */
+    function gestureOf(event) {
+      if (event.altKey) return null
+      if (typeof event.getModifierState === 'function' && event.getModifierState('AltGraph')) return null
+      if (event.ctrlKey && event.metaKey) return null
+      const chord = event.ctrlKey || event.metaKey
+      if (chord && event.shiftKey) return null
+      return chord ? 'ctrlEnter' : event.shiftKey ? 'shiftEnter' : 'enter'
+    }
+
+    /**
+     * @returns whether a keydown landed on a composer-shaped editable surface:
+     *   a card whose editable host is actually editable. The card scope is what
+     *   keeps this safe — DSH has exactly one contenteditable in the client.
+     * @param target - the keydown target.
+     */
+    function isComposerShaped(target) {
+      if (!(target instanceof Element)) return false
+      if (target.closest(CARD_SELECTOR) === null) return false
+      const editable = target.closest(EDITABLE_SELECTOR)
+      return editable !== null && editable.isContentEditable === true
     }
 
     /** Whether a composer has been seen, used by the settings-page self-check. */
     let sawComposer = false
     /** Whether the "anchor missing" warning was already emitted. */
     let anchorWarningShown = false
+    /** The last Enter this plugin saw: its gesture and the exit that was taken. */
+    let lastKey = null
+    /** How many Enters were swallowed because the popup had no highlight. */
+    let menuBlocks = 0
+
+    /**
+     * Record one keydown decision for the diagnostics API.
+     * @param decision - the exit the handler took.
+     * @param gesture - the gesture, or null for a reserved chord.
+     * @returns the stored record.
+     */
+    function decided(decision, gesture) {
+      lastKey = { at: Date.now(), gesture: gesture ?? null, decision }
+      return lastKey
+    }
 
     /**
      * Warn once when an editable composer card no longer owns a
@@ -377,31 +469,56 @@ window.__ModuleLoader__.load({
     function onKeyDown(event) {
       if (replayed.has(event)) return
       if (event.key !== 'Enter') return
-      const composer = composerRoot(event.target)
+      const target = event.target
+      const gesture = gestureOf(event)
+      const composer = composerRoot(target)
       if (composer === null) {
-        warnMissingAnchor(event.target)
+        warnMissingAnchor(target)
+        // Without the anchor the gesture cannot be mapped. Failing safe means
+        // swallowing a send, never letting the host send half a draft.
+        if (gesture === null || preset !== 'plugin') return
+        if (composing || event.isComposing || event.keyCode === 229) return
+        // A line break never sends, so Shift+Enter keeps its native path.
+        if (gesture === 'shiftEnter') return
+        if (!isComposerShaped(target)) return
+        const missingCard = target.closest(CARD_SELECTOR)
+        if (menuState(missingCard, missingCard) === 'pick') return
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        decided('anchor-missing-blocked', gesture)
         return
       }
       sawComposer = true
       // The default preset leaves every gesture to DSH itself.
-      if (preset === 'dsh') return
+      if (preset === 'dsh') { decided('preset-dsh', gesture); return }
       // A real composition owns this Enter (candidate pick): let the IME have it.
-      if (composing || event.isComposing || event.keyCode === 229) return
+      if (composing || event.isComposing || event.keyCode === 229) { decided('composing', gesture); return }
       // A read-only composer refuses input: leave it alone.
-      if (!composer.isContentEditable) return
-      if (event.altKey) return
-      if (typeof event.getModifierState === 'function' && event.getModifierState('AltGraph')) return
+      if (!composer.isContentEditable) { decided('readonly', gesture); return }
       // Both primary modifiers, or a primary modifier plus Shift, keep their
       // zero behavior in the composer.
-      if (event.ctrlKey && event.metaKey) return
-      const chord = event.ctrlKey || event.metaKey
-      if (chord && event.shiftKey) return
-      const gesture = chord ? 'ctrlEnter' : event.shiftKey ? 'shiftEnter' : 'enter'
-      // An open completion menu owns Enter (pick the highlight), as before.
-      if (completionMenuOpen(composer)) return
+      if (gesture === null) { decided('reserved', gesture); return }
+      const card = composer.closest(CARD_SELECTOR)
+      const menu = menuState(card ?? document, card)
+      // A highlight means the popup owns Enter and picks the candidate.
+      if (menu === 'pick') { decided('menu-pick', gesture); return }
+      if (menu === 'block') {
+        // The popup is open without a highlight: DSH's arbitration answers
+        // "pass" and the key would fall through to a submit. Nobody asked for a
+        // send here, so swallow it; Shift+Enter still breaks the line.
+        if (gesture === 'shiftEnter') { decided('native-newline', gesture); return }
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        menuBlocks += 1
+        if (menuBlocks === 1) {
+          console.info(LOG, 'enter blocked: the completion menu is open without a highlight')
+        }
+        decided('menu-blocked', gesture)
+        return
+      }
       const action = bindings[gesture]
       // Shift+Enter mapped to a line break is already the composer's behavior.
-      if (gesture === 'shiftEnter' && action === 'newline') return
+      if (gesture === 'shiftEnter' && action === 'newline') { decided('native-newline', gesture); return }
       event.preventDefault()
       event.stopImmediatePropagation()
       // A send replayed inside DSH's post-composition window would be swallowed
@@ -409,10 +526,51 @@ window.__ModuleLoader__.load({
       // the composer's keymap handles Shift+Enter before its IME check.
       if (action !== 'newline' && Date.now() < composingUntil) {
         deferSend(composer, action, event.repeat, composingUntil)
+        decided('ime-deferred', gesture)
         return
       }
+      decided(action, gesture)
       runAction(action, event, composer)
     }
+
+    // --- diagnostics --------------------------------------------------------
+
+    /**
+     * The live state of the plugin, for the console API and the Settings page.
+     * @returns a JSON-friendly snapshot.
+     */
+    function getStatus() {
+      const composers = document.querySelectorAll(COMPOSER_SELECTOR).length
+      return {
+        plugin: PLUGIN_NAME,
+        version: VERSION,
+        preset,
+        bindings: { ...bindings },
+        busyEnter: readBusyEnter() ?? 'unknown',
+        anchor: anchorWarningShown ? 'missing' : composers > 0 || sawComposer ? 'found' : 'unknown',
+        composers,
+        lastKey,
+        menuBlocks,
+        storage: storageFailed ? 'volatile' : 'local',
+      }
+    }
+
+    /**
+     * @returns a copy of the live binding map.
+     */
+    function getBindings() {
+      return { ...bindings }
+    }
+
+    /**
+     * @returns the status snapshot as pretty-printed JSON (for bug reports).
+     */
+    function inspect() {
+      return JSON.stringify(getStatus(), null, 2)
+    }
+
+    /** The object installed on `window` while the plugin is applied. */
+    const DIAGNOSTICS = { version: VERSION, getStatus, getBindings, inspect }
 
     // --- settings page ------------------------------------------------------
 
@@ -437,6 +595,8 @@ window.__ModuleLoader__.load({
         'anchor.found': '输入框锚点：已检测到',
         'anchor.missing': '输入框锚点：未检测到（DSH 可能改版，详见控制台）',
         'anchor.unknown': '输入框锚点：尚未检测到（打开一个会话后回到此页可复查）',
+        'diagnostics.copy': '复制诊断',
+        'storage.volatile': '浏览器存储不可用：当前设置只在本次会话生效。',
         'io.title': '导出 / 导入',
         'io.export': '导出',
         'io.copy': '复制',
@@ -471,6 +631,8 @@ window.__ModuleLoader__.load({
         'anchor.found': 'Composer anchor: detected',
         'anchor.missing': 'Composer anchor: not detected (DSH may have changed; see the console)',
         'anchor.unknown': 'Composer anchor: not detected yet (open a session and revisit this page)',
+        'diagnostics.copy': 'Copy diagnostics',
+        'storage.volatile': 'Browser storage is unavailable; this setting only lasts for this session.',
         'io.title': 'Export / import',
         'io.export': 'Export',
         'io.copy': 'Copy',
@@ -682,8 +844,15 @@ window.__ModuleLoader__.load({
         lineHeight: '18px',
         color: 'var(--dsw-alias-label-tertiary)',
       },
+      anchorRow: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: '8px',
+        marginTop: '14px',
+      },
       anchor: {
-        margin: '14px 0 0',
+        margin: '0',
         fontSize: '12px',
         lineHeight: '18px',
         color: 'var(--dsw-alias-label-tertiary)',
@@ -897,6 +1066,24 @@ window.__ModuleLoader__.load({
         setIoStatus(t('io.imported'))
       }
 
+      // The same snapshot the console API returns: one click for bug reports.
+      // Without a clipboard the JSON lands in the export box, so it can still
+      // be selected and copied by hand.
+      const copyDiagnostics = () => {
+        const text = inspect()
+        const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
+        if (clipboard === undefined || typeof clipboard.writeText !== 'function') {
+          setIoText(text)
+          setIoError(t('io.copyFailed'))
+          setIoStatus('')
+          return
+        }
+        clipboard.writeText(text).then(
+          () => { setError(''); setIoError(''); setIoStatus(t('io.copied')) },
+          () => { setIoText(text); setIoError(t('io.copyFailed')); setIoStatus('') },
+        )
+      }
+
       return h('div', { style: STYLE.page },
         h('h2', { style: STYLE.pageTitle }, t('page.title')),
         h('div', { style: STYLE.statusBox, role: 'status' },
@@ -944,7 +1131,14 @@ window.__ModuleLoader__.load({
             disabled: !dirty,
             onClick: save,
           }, t('button.save'))) : null,
-        h('p', { style: STYLE.anchor }, anchorText),
+        h('div', { style: STYLE.anchorRow },
+          h('p', { style: STYLE.anchor }, anchorText),
+          h('button', {
+            type: 'button',
+            style: { ...STYLE.smallButton, ...STYLE.secondary },
+            onClick: copyDiagnostics,
+          }, t('diagnostics.copy'))),
+        storageFailed ? h('p', { style: STYLE.note, role: 'status' }, t('storage.volatile')) : null,
         h('div', { style: STYLE.sectionTitle }, t('io.title')),
         h('textarea', {
           style: STYLE.textarea,
@@ -1004,9 +1198,10 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       // Exposed for the bundled check (`npm test`); nothing in DSH reads it.
       __test: {
-        DEFAULT_BINDINGS, GESTURES, PRESET_KEY, STORAGE_KEY,
+        DEFAULT_BINDINGS, GESTURES, PRESET_KEY, STORAGE_KEY, VERSION,
         normalizeBindings, sameBindings, validateBindings,
         buildExportDocument, parseImportDocument,
+        menuState, gestureOf, isComposerShaped, getStatus,
       },
       apply(ctx) {
         ctx.effect(() => {
@@ -1038,6 +1233,15 @@ window.__ModuleLoader__.load({
 
         ctx.effect(() => ctx.locale.register(NS, DICT), 'composer-enter-newline: dictionaries')
         const t = ctx.locale.bind(NS)
+
+        // Both the browser console and the Settings page read this object; it
+        // is removed again on dispose only if it is still ours.
+        ctx.effect(() => {
+          window.__dshEnterNewline = DIAGNOSTICS
+          return () => {
+            if (window.__dshEnterNewline === DIAGNOSTICS) delete window.__dshEnterNewline
+          }
+        }, 'composer-enter-newline: diagnostics')
 
         console.info(LOG, 'active', { preset, bindings: { ...bindings } })
 
