@@ -46,7 +46,19 @@
  *
  * 4. Settings page ("Enter 换行"): the effective mapping summary, the two
  *    presets, the three gesture selects (plugin preset only), Save/Discard,
- *    export/import of the saved configuration, and a runtime self-check.
+ *    export/import of the saved configuration, a runtime self-check, and the
+ *    optional side-chat follow switch.
+ *
+ * 5. Side chat (dsh-better-sidebar): its composer is a plain textarea with its
+ *    own two-mode keymap (Enter sends, or Ctrl/Cmd+Enter sends), so it cannot
+ *    carry three absolute actions. Instead of intercepting its keys, the page
+ *    shows that mode read-only and live, and an opt-in switch projects this
+ *    plugin's Enter mapping onto it by writing the side card's own
+ *    `pluginSettings.sidechat.submitKey` through the settings forms service —
+ *    the side card keeps native textarea editing, its undo stack and its IME
+ *    guard. The namespace is found by its schema shape (the row id is a mount
+ *    choice), and the switch turns itself off when the observed mode can only
+ *    have come from the user editing the side card's page.
  *
  *    Bindings persist in localStorage (`composer-enter-newline:bindings:v1`)
  *    and the preset in `composer-enter-newline:preset`: a key map belongs to
@@ -60,7 +72,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-enter-newline',
   factory(require) {
     const React = require('react')
-    const { useState } = React
+    const { useState, useEffect } = React
     const h = React.createElement
 
     /** Package name used in console diagnostics. */
@@ -84,7 +96,7 @@ window.__ModuleLoader__.load({
     /** The highlight reaches the DOM only through this attribute. */
     const HIGHLIGHT_ATTR = 'aria-activedescendant'
     /** Package version exposed by the diagnostics API (`npm test` keeps it honest). */
-    const VERSION = '1.3.2'
+    const VERSION = '1.4.0'
     /** Mirrors DSH's own `composingUntil = Date.now() + 10`, with a 2ms margin. */
     const COMPOSITION_GRACE_MS = 12
     /** Replayed events, so the capture listener ignores its own dispatches. */
@@ -182,6 +194,8 @@ window.__ModuleLoader__.load({
       bindings = normalizeBindings(next)
       const stored = persist(STORAGE_KEY, JSON.stringify(bindings))
       console.info(LOG, stored ? 'bindings saved' : 'bindings saved (not persisted)', { ...bindings })
+      // The side card's mode is a projection of this map: re-project on change.
+      reconcileSideChat()
       return bindings
     }
 
@@ -208,11 +222,297 @@ window.__ModuleLoader__.load({
       preset = next === 'dsh' ? 'dsh' : 'plugin'
       persist(PRESET_KEY, preset)
       console.info(LOG, 'preset', preset)
+      // The default preset means "native everywhere", which the side card also
+      // conceals as its own `enter` default.
+      reconcileSideChat()
       return preset
     }
 
     /** Live preset the keydown listener reads ("dsh" = leave everything native). */
     let preset = readPreset()
+
+    // --- side chat (dsh-better-sidebar) -------------------------------------
+
+    /*
+     * The side card's own composer is a plain textarea with its own two-mode
+     * keymap (`submitKey`: Enter sends, or Ctrl/Cmd+Enter sends). Two modes
+     * cannot carry three absolute actions, so this integration does not
+     * intercept its keys: while the switch is on, this plugin's Enter mapping
+     * is PROJECTED onto that mode and written into the side card's own
+     * settings. Everything else keeps running in the side card's code, which
+     * keeps native textarea editing, its undo stack and its IME guard intact.
+     *
+     * The page always shows the mode the side card currently holds, read-only
+     * and live, whether the switch is on or off. The switch turns itself off
+     * when the mode it sees can only have come from the user editing the side
+     * card's page — never merely because a write is still in flight.
+     */
+
+    /** Storage key of the follow switch (independent of the binding map). */
+    const SIDE_CHAT_KEY = 'composer-enter-newline:sidechat-sync'
+    /** Config fields only the side card's row schema declares. */
+    const SIDE_CHAT_SIGNATURE = ['pluginSettings', 'tabsEnabled']
+    /** The side card's settings namespace (its Loader row id), once discovered. */
+    let sideChatNamespace = null
+    /** The side card's settings form, once the namespace is served. */
+    let sideChatForm = null
+    /** Mode the side card reports: 'enter' | 'mod-enter', or null when unreadable. */
+    let sideChatMode = null
+    /** How many namespaces the settings document reports (detection diagnostics). */
+    let sideChatNamespaces = null
+    /** The mode this plugin last wrote or adopted; a different one is a user edit. */
+    let sideChatOwnedMode = null
+    /** Whether the follow switch is on; off by default and persisted. */
+    let sideChatFollow = readSideChatFollow()
+    /** A write is in flight, so observations until it settles are not user edits. */
+    let sideChatPending = false
+    /** The last write was refused or failed. */
+    let sideChatRejected = false
+    /** The switch turned itself off because the side card holds another mode. */
+    let sideChatConflict = false
+    /** Mounted settings pages, re-rendered whenever the side card changes. */
+    const pageListeners = new Set()
+
+    /** @returns whether a listener was added. */
+    function subscribePage(listener) {
+      pageListeners.add(listener)
+      return () => { pageListeners.delete(listener) }
+    }
+
+    /** Re-render every mounted settings page. */
+    function notifyPage() {
+      for (const listener of [...pageListeners]) {
+        try {
+          listener()
+        } catch { /* one page must not break the sync */ }
+      }
+    }
+
+    /** @returns whether the follow switch was persisted on. */
+    function readSideChatFollow() {
+      try {
+        return window.localStorage.getItem(SIDE_CHAT_KEY) === 'on'
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * Locate the side card's namespace by its schema shape: the row id is a
+     * mount choice (`better-sidebar`, `web-ui-better-sidebar`, …), so an id
+     * search would miss re-mounted deployments. The wire schema is schemastery's
+     * compressed envelope — `{ uid, refs }` with the root node at
+     * `refs[uid]` — so the shape lives there, not on the envelope itself.
+     * @param view - the settings mirror's describe view.
+     * @returns the namespace, or null when no row carries that schema.
+     */
+    function findSideChatNamespace(view) {
+      const namespaces = view?.namespaces
+      if (!Array.isArray(namespaces)) return null
+      for (const namespace of namespaces) {
+        const schema = namespace?.schema
+        if (schema === null || typeof schema !== 'object') continue
+        const refs = schema.refs
+        const root = refs !== null && typeof refs === 'object'
+          ? refs[String(schema.uid)]
+          : schema
+        const dict = root?.dict
+        if (dict === null || typeof dict !== 'object') continue
+        if (SIDE_CHAT_SIGNATURE.every(field => Object.hasOwn(dict, field))) return namespace.ns
+      }
+      // Second pass on the resolved value: a `pluginSettings.sidechat` blob is
+      // unambiguous, and survives a future rename of the schema fields.
+      for (const namespace of namespaces) {
+        const blob = namespace?.value?.pluginSettings
+        if (blob === null || typeof blob !== 'object') continue
+        const sidechat = blob.sidechat
+        if (sidechat !== null && typeof sidechat === 'object') return namespace.ns
+      }
+      return null
+    }
+
+    /**
+     * The mode the side card reports, mirroring its own parser (anything that
+     * is not `mod-enter` reads as `enter`).
+     * @param value - the resolved settings section.
+     * @returns the mode, or null when the section has not resolved yet.
+     */
+    function readSideChatMode(value) {
+      if (value === null || value === undefined) return null
+      return value.pluginSettings?.sidechat?.submitKey === 'mod-enter' ? 'mod-enter' : 'enter'
+    }
+
+    /**
+     * The side card mode this plugin's own mapping projects onto. Its two modes
+     * only answer "which key sends", so Enter's meaning is the one carried over.
+     * @returns 'mod-enter' when Enter means a line break, else 'enter'.
+     */
+    function projectSideChatMode() {
+      if (preset === 'dsh') return 'enter'
+      return bindings.enter === 'newline' ? 'mod-enter' : 'enter'
+    }
+
+    /**
+     * Write one mode into the side card's own settings blob (a declared open
+     * map, so this is the plugin's supported cross-plugin seam).
+     * @param mode - 'enter' or 'mod-enter'.
+     * @returns whether the side card accepted it.
+     */
+    async function writeSideChat(mode) {
+      if (sideChatForm === null) return false
+      sideChatPending = true
+      try {
+        const accepted = await sideChatForm.mutate([
+          { op: 'set', path: ['pluginSettings', 'sidechat', 'submitKey'], value: mode },
+        ])
+        sideChatRejected = accepted === false
+        if (accepted !== false) sideChatOwnedMode = mode
+        return accepted !== false
+      } catch {
+        sideChatRejected = true
+        return false
+      } finally {
+        sideChatPending = false
+        notifyPage()
+      }
+    }
+
+    /**
+     * Keep the side card's mode equal to this plugin's projection while the
+     * switch is on, and stop following when the difference can only be the
+     * user's own edit on the side card's page.
+     */
+    function reconcileSideChat() {
+      if (!sideChatFollow || sideChatPending || sideChatMode === null) return
+      const target = projectSideChatMode()
+      if (sideChatMode === target) {
+        sideChatOwnedMode = sideChatMode
+        sideChatRejected = false
+        return
+      }
+      // Our own projection moved (mapping or preset change, or the first write
+      // after enabling): adopt the observed mode first, so the snapshot that
+      // follows our write cannot be mistaken for a user edit.
+      if (sideChatOwnedMode === null || sideChatMode === sideChatOwnedMode) {
+        sideChatOwnedMode = sideChatMode
+        void writeSideChat(target)
+        return
+      }
+      // Neither what we wrote nor what our mapping asks for: the user picked
+      // another mode there. Stop following instead of fighting their choice.
+      sideChatFollow = false
+      sideChatConflict = true
+      persist(SIDE_CHAT_KEY, 'off')
+      notifyPage()
+    }
+
+    /**
+     * Adopt one side-card snapshot into the live state.
+     */
+    function adoptSideChat() {
+      let value
+      try {
+        value = sideChatForm?.getSnapshot()?.value
+      } catch {
+        value = undefined
+      }
+      sideChatMode = readSideChatMode(value)
+      reconcileSideChat()
+      notifyPage()
+    }
+
+    /**
+     * Turn the follow switch on or off.
+     * @param next - the requested state.
+     */
+    function setSideChatFollow(next) {
+      sideChatConflict = false
+      sideChatRejected = false
+      if (!next) {
+        sideChatFollow = false
+        persist(SIDE_CHAT_KEY, 'off')
+        notifyPage()
+        return
+      }
+      // Adopt what the side card holds now: only a LATER change we did not
+      // write may count as the user editing it.
+      sideChatOwnedMode = sideChatMode
+      sideChatFollow = true
+      persist(SIDE_CHAT_KEY, 'on')
+      const target = projectSideChatMode()
+      if (sideChatMode !== null && sideChatMode !== target) void writeSideChat(target)
+      notifyPage()
+    }
+
+    /**
+     * Follow one side-card namespace: subscribe to its form and adopt snapshots.
+     * @param configForms - the settings forms service.
+     * @param namespace - the side card's Loader row id.
+     * @returns the subscription teardown.
+     */
+    function attachSideChat(configForms, namespace) {
+      sideChatNamespace = namespace
+      try {
+        sideChatForm = configForms.get(namespace)
+      } catch {
+        // A served row whose form cannot be opened stays "not detected": the
+        // page must not claim a mode it cannot read.
+        sideChatForm = null
+        sideChatNamespace = null
+        return () => {}
+      }
+      const off = sideChatForm.subscribe(adoptSideChat)
+      adoptSideChat()
+      return () => {
+        off()
+        sideChatForm = null
+        sideChatNamespace = null
+        sideChatMode = null
+        notifyPage()
+      }
+    }
+
+    /**
+     * Discover the side card from the settings mirror and (re)attach when the
+     * document reports it, because describe only lists live plugin rows.
+     * @param configForms - the settings forms service.
+     * @returns the teardown for both subscriptions.
+     */
+    function watchSideChat(configForms) {
+      let offForm = null
+      let offMirror = null
+      const discover = () => {
+        let view
+        try {
+          view = configForms.describe().getSnapshot().view
+        } catch {
+          view = undefined
+        }
+        const namespace = findSideChatNamespace(view)
+        sideChatNamespaces = Array.isArray(view?.namespaces) ? view.namespaces.length : null
+        if (namespace === null) {
+          if (offForm !== null) {
+            offForm()
+            offForm = null
+            notifyPage()
+          }
+          return
+        }
+        if (namespace === sideChatNamespace && sideChatForm !== null) return
+        if (offForm !== null) offForm()
+        offForm = attachSideChat(configForms, namespace)
+      }
+      discover()
+      try {
+        offMirror = configForms.describe().subscribe(discover)
+      } catch {
+        offMirror = null
+      }
+      return () => {
+        if (offForm !== null) offForm()
+        if (offMirror !== null) offMirror()
+      }
+    }
 
     // --- composer key remap -------------------------------------------------
 
@@ -572,6 +872,13 @@ window.__ModuleLoader__.load({
         lastKey,
         menuBlocks,
         storage: storageFailed ? 'volatile' : 'local',
+        sideChat: {
+          present: sideChatNamespace !== null,
+          mode: sideChatMode,
+          follow: sideChatFollow,
+          namespaces: sideChatNamespaces,
+          sync: sideChatConflict ? 'conflict' : sideChatRejected ? 'rejected' : sideChatFollow ? 'on' : 'off',
+        },
       }
     }
 
@@ -616,6 +923,16 @@ window.__ModuleLoader__.load({
         'anchor.found': '输入框锚点：已检测到',
         'anchor.missing': '输入框锚点：未检测到（DSH 可能改版，详见控制台）',
         'anchor.unknown': '输入框锚点：尚未检测到（打开一个会话后回到此页可复查）',
+        'sideChat.title': '侧边对话（dsh-better-sidebar）',
+        'sideChat.missing': '未检测到 dsh-better-sidebar：安装并启用它之后，这里会显示侧边对话的发送键。',
+        'sideChat.loading': '正在读取侧边栏设置…',
+        'sideChat.mode.enter': '侧边对话发送键：Enter 发送 · Shift+Enter 换行',
+        'sideChat.mode.modEnter': '侧边对话发送键：Ctrl/Cmd+Enter 发送 · Enter 与 Shift+Enter 换行',
+        'sideChat.follow': '跟随本插件的映射',
+        'sideChat.limit': '当前版本的侧边栏插件只支持「发送 / 换行」两态，因此不会修改 Shift+Enter 的行为。',
+        'sideChat.synced': '已同步',
+        'sideChat.rejected': '侧边栏拒绝了这次写入，它仍保持原值；下次保存时会重试。',
+        'sideChat.conflict': '侧边栏里被手动改成了别的模式，跟随已自动关闭。',
         'diagnostics.copy': '复制诊断',
         'storage.volatile': '浏览器存储不可用：当前设置只在本次会话生效。',
         'io.title': '导出 / 导入',
@@ -653,6 +970,16 @@ window.__ModuleLoader__.load({
         'anchor.found': 'Composer anchor: detected',
         'anchor.missing': 'Composer anchor: not detected (DSH may have changed; see the console)',
         'anchor.unknown': 'Composer anchor: not detected yet (open a session and revisit this page)',
+        'sideChat.title': 'Side chat (dsh-better-sidebar)',
+        'sideChat.missing': 'dsh-better-sidebar was not found; install and enable it to see its submit key here.',
+        'sideChat.loading': 'Reading the side card settings…',
+        'sideChat.mode.enter': 'Side-chat submit key: Enter sends · Shift+Enter breaks the line (read-only, always the side card\'s own setting)',
+        'sideChat.mode.modEnter': 'Side-chat submit key: Ctrl/Cmd+Enter sends · Enter and Shift+Enter break the line (read-only, always the side card\'s own setting)',
+        'sideChat.follow': 'Follow this plugin\'s mapping',
+        'sideChat.limit': 'The side card supports only send / line break in this version, so Shift+Enter keeps its behavior.',
+        'sideChat.synced': 'Synced',
+        'sideChat.rejected': 'The side card refused the write and keeps its value; the next save retries.',
+        'sideChat.conflict': 'The side card holds another mode you picked there; following was turned off.',
         'diagnostics.copy': 'Copy diagnostics',
         'storage.volatile': 'Browser storage is unavailable; this setting only lasts for this session.',
         'io.title': 'Export / import',
@@ -886,6 +1213,80 @@ window.__ModuleLoader__.load({
         lineHeight: '18px',
         color: 'var(--dsw-alias-label-tertiary)',
       },
+      sideChatMode: {
+        margin: '6px 0 0',
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      sideChatMissing: {
+        margin: '6px 0 0',
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-label-tertiary)',
+      },
+      sideChatRow: {
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: '10px',
+        marginTop: '10px',
+      },
+      switch: {
+        position: 'relative',
+        flex: 'none',
+        width: '36px',
+        height: '20px',
+        marginTop: '2px',
+        padding: '0',
+        border: 'none',
+        borderRadius: '10px',
+        cursor: 'pointer',
+      },
+      switchOn: {
+        background: 'var(--dsw-alias-brand-primary-new-color, #4d6bfe)',
+      },
+      switchOff: {
+        background: 'var(--dsw-alias-bg-module-platform)',
+        boxShadow: 'inset 0 0 0 0.5px var(--dsw-alias-border-l2)',
+      },
+      switchKnob: {
+        position: 'absolute',
+        top: '2px',
+        left: '2px',
+        width: '16px',
+        height: '16px',
+        borderRadius: '50%',
+        background: '#fff',
+      },
+      sideChatCopy: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '2px',
+      },
+      sideChatFollow: {
+        margin: '0',
+        fontSize: '13px',
+        lineHeight: '20px',
+        color: 'var(--dsw-alias-label-primary)',
+      },
+      sideChatNote: {
+        margin: '0',
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-label-tertiary)',
+      },
+      sideChatOk: {
+        margin: '0',
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-state-success-primary)',
+      },
+      sideChatWarn: {
+        margin: '0',
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-state-warn-primary)',
+      },
       textarea: {
         width: '100%',
         minHeight: '96px',
@@ -991,6 +1392,11 @@ window.__ModuleLoader__.load({
       const [ioText, setIoText] = useState('')
       const [ioStatus, setIoStatus] = useState('')
       const [ioError, setIoError] = useState('')
+      // The side card writes its own settings, so this page cannot learn about
+      // a change from its own state: it re-renders on the sync store instead.
+      const [, setPageTick] = useState(0)
+
+      useEffect(() => subscribePage(() => { setPageTick(tick => tick + 1) }), [])
 
       // Every hook is declared above this line, so the order is stable.
       const options = ACTION_OPTIONS.map(option => ({ value: option.value, label: t(option.key) }))
@@ -1171,6 +1577,32 @@ window.__ModuleLoader__.load({
             disabled: !dirty,
             onClick: save,
           }, t('button.save'))) : null,
+        h('div', { style: STYLE.sectionTitle }, t('sideChat.title')),
+        h('p', {
+          style: sideChatMode === null ? STYLE.sideChatMissing : STYLE.sideChatMode,
+          role: 'status',
+        }, sideChatNamespace === null
+          ? t('sideChat.missing')
+          : sideChatMode === null
+            ? t('sideChat.loading')
+            : t(sideChatMode === 'mod-enter' ? 'sideChat.mode.modEnter' : 'sideChat.mode.enter')),
+        sideChatMode === null ? null : h('div', { style: STYLE.sideChatRow },
+          h('button', {
+            type: 'button',
+            role: 'switch',
+            'aria-checked': sideChatFollow,
+            'aria-label': t('sideChat.follow'),
+            style: { ...STYLE.switch, ...(sideChatFollow ? STYLE.switchOn : STYLE.switchOff) },
+            onClick: () => { setSideChatFollow(!sideChatFollow) },
+          }, h('span', {
+            style: { ...STYLE.switchKnob, ...(sideChatFollow ? { transform: 'translateX(16px)' } : null) },
+          })),
+          h('div', { style: STYLE.sideChatCopy },
+            h('p', { style: STYLE.sideChatFollow }, t('sideChat.follow')),
+            h('p', { style: STYLE.sideChatNote }, t('sideChat.limit')),
+            sideChatConflict ? h('p', { style: STYLE.sideChatWarn, role: 'alert' }, t('sideChat.conflict')) : null,
+            sideChatFollow && sideChatRejected ? h('p', { style: STYLE.sideChatWarn, role: 'alert' }, t('sideChat.rejected')) : null,
+            sideChatFollow && !sideChatRejected ? h('span', { style: STYLE.sideChatOk, role: 'status' }, t('sideChat.synced')) : null)),
         h('div', { style: STYLE.anchorRow },
           h('p', { style: STYLE.anchor }, anchorText),
           h('button', {
@@ -1238,10 +1670,11 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       // Exposed for the bundled check (`npm test`); nothing in DSH reads it.
       __test: {
-        DEFAULT_BINDINGS, GESTURES, PRESET_KEY, STORAGE_KEY, VERSION,
+        DEFAULT_BINDINGS, GESTURES, PRESET_KEY, STORAGE_KEY, SIDE_CHAT_KEY, VERSION,
         normalizeBindings, sameBindings, validateBindings,
         buildExportDocument, parseImportDocument,
         menuState, gestureOf, isComposerShaped, getStatus,
+        findSideChatNamespace, projectSideChatMode, readSideChatMode,
       },
       apply(ctx) {
         ctx.effect(() => {
@@ -1261,6 +1694,9 @@ window.__ModuleLoader__.load({
 
         // The busy-send preference decides which gesture carries which mode;
         // without the settings service every send falls back to plain Enter.
+        // The same service carries the side card's own settings row, which the
+        // follow switch projects this plugin's mapping onto.
+        let stopSideChat = null
         if (typeof ctx.inject === 'function') {
           ctx.inject(['configForms'], (scope) => {
             try {
@@ -1268,8 +1704,19 @@ window.__ModuleLoader__.load({
             } catch {
               conversationForm = null
             }
+            try {
+              stopSideChat = watchSideChat(scope.configForms)
+            } catch {
+              stopSideChat = null
+            }
           })
         }
+        ctx.effect(() => () => {
+          if (stopSideChat !== null) {
+            stopSideChat()
+            stopSideChat = null
+          }
+        }, 'composer-enter-newline: side chat follow')
 
         ctx.effect(() => ctx.locale.register(NS, DICT), 'composer-enter-newline: dictionaries')
         const t = ctx.locale.bind(NS)

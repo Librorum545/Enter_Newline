@@ -6,7 +6,7 @@ const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 // Minimal React stand-in: elements become plain descriptor objects, and useState
 // keeps a per-component hook store so the Settings page can be driven like a
 // real render (change a preset, edit a select, click Save, render again).
-const hooks = { index: 0, store: [] }
+const hooks = { index: 0, store: [], effects: new Set(), cleanups: [] }
 const React = {
   createElement(type, props, ...children) {
     return { type, props: { ...(props ?? {}), children: children.filter(c => c !== undefined && c !== null) } }
@@ -18,6 +18,15 @@ const React = {
       hooks.store[slot] = typeof value === 'function' ? value(hooks.store[slot]) : value
     }
     return [hooks.store[slot], set]
+  },
+  // The page subscribes to the side-chat store; a stand-in runs the effect once
+  // per mount (the harness re-renders by calling the component again).
+  useEffect(fn) {
+    const slot = `effect-${hooks.index++}`
+    if (hooks.effects.has(slot)) return
+    hooks.effects.add(slot)
+    const dispose = fn()
+    if (typeof dispose === 'function') hooks.cleanups.push(dispose)
   },
 }
 
@@ -96,6 +105,7 @@ assert.equal(registration.id, 'dsh-enter-newline')
 
 const STORAGE_KEY = 'composer-enter-newline:bindings:v1'
 const PRESET_KEY = 'composer-enter-newline:preset'
+const SIDE_CHAT_KEY = 'composer-enter-newline:sidechat-sync'
 
 // Capture the plugin's console diagnostics instead of printing them.
 const logs = { info: [], warn: [] }
@@ -113,23 +123,67 @@ const createPlugin = () => registration.factory(name => {
   throw new Error(`unexpected require: ${name}`)
 })
 
-const mount = ({ bindings, preset, busyEnter } = {}) => {
+const mount = ({ bindings, preset, busyEnter, sidebar, sidechatFollow } = {}) => {
   listeners = []
   disposers.length = 0
   hooks.index = 0
   hooks.store.length = 0
+  hooks.effects.clear()
+  hooks.cleanups.length = 0
   fakeDocument.composers = []
   fakeDocument.menus = []
   if (bindings === undefined) storage.delete(STORAGE_KEY)
   else storage.set(STORAGE_KEY, JSON.stringify(bindings))
   if (preset === undefined) storage.delete(PRESET_KEY)
   else storage.set(PRESET_KEY, preset)
+  if (sidechatFollow === undefined) storage.delete(SIDE_CHAT_KEY)
+  else storage.set(SIDE_CHAT_KEY, sidechatFollow ? 'on' : 'off')
 
   const plugin = createPlugin()
   const registrations = []
   const dictionaries = []
   const conversationForm = {
     getSnapshot: () => ({ value: busyEnter === undefined ? undefined : { busyEnter } }),
+  }
+  const sidebarForm = sidebar === undefined
+    ? null
+    : makeForm({ value: { pluginSettings: { sidechat: { submitKey: sidebar } } } })
+  const held = {
+    form: sidebarForm,
+    namespaces: sidebarForm === null
+      ? []
+      : [{
+        ns: 'better-sidebar',
+        // The wire schema is schemastery's compressed envelope: the root node
+        // lives at refs[uid], not on the envelope.
+        schema: {
+          uid: 15,
+          refs: {
+            15: { type: 'object', dict: { pluginSettings: 13, tabsEnabled: 14 } },
+            13: { type: 'dict', inner: 1 },
+            14: { type: 'dict', inner: 6 },
+          },
+        },
+      }],
+  }
+  const mirrorListeners = new Set()
+  const mirror = {
+    getSnapshot: () => ({ status: 'ready', view: { namespaces: held.namespaces, writable: true, hasDocument: true }, error: null }),
+    subscribe(fn) { mirrorListeners.add(fn); return () => mirrorListeners.delete(fn) },
+    ensure: async () => {},
+    acceptView() {},
+    setNamespaces(namespaces) {
+      held.namespaces = namespaces
+      for (const fn of [...mirrorListeners]) fn()
+    },
+  }
+  const configForms = {
+    get(namespace) {
+      if (namespace === 'ui-conversation') return conversationForm
+      if (namespace === 'better-sidebar' && sidebarForm !== null) return sidebarForm
+      throw new Error(`unexpected namespace: ${namespace}`)
+    },
+    describe: () => mirror,
   }
   const ctx = {
     // Keep the disposers instead of running them at once: the real ctx.effect()
@@ -138,13 +192,7 @@ const mount = ({ bindings, preset, busyEnter } = {}) => {
     effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose) },
     inject(deps, callback) {
       if (!deps.includes('configForms')) return
-      callback({
-        configForms: { get: namespace => {
-          assert.equal(namespace, 'ui-conversation')
-          return conversationForm
-        } },
-        effect() {},
-      })
+      callback({ configForms, effect() {} })
     },
     locale: {
       register(ns, dicts) {
@@ -164,7 +212,43 @@ const mount = ({ bindings, preset, busyEnter } = {}) => {
     },
   }
   plugin.apply(ctx)
-  return { plugin, registrations, dictionaries, disposers }
+  return { plugin, registrations, dictionaries, disposers, sidebarForm, mirror }
+}
+
+/** Apply one settings path op the way the Host does (creating maps as needed). */
+const applySet = (value, path, next) => {
+  if (path.length === 0) return next
+  const [head, ...rest] = path
+  const base = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  return { ...base, [head]: applySet(base[head], rest, next) }
+}
+
+/** A settings form stand-in: snapshots, subscriptions, and Host-like echoes. */
+const makeForm = ({ status = 'ready', value = undefined } = {}) => {
+  const subscribers = new Set()
+  const form = {
+    calls: [],
+    accept: true,
+    hold: null,
+    snapshot: { status, value, base: {}, user: {}, revision: 1, writable: true },
+    getSnapshot: () => form.snapshot,
+    subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn) },
+    emit(patch) {
+      form.snapshot = { ...form.snapshot, ...patch }
+      for (const fn of [...subscribers]) fn()
+    },
+    async mutate(ops) {
+      form.calls.push(ops)
+      if (form.hold !== null) await form.hold
+      if (!form.accept) return false
+      let next = form.snapshot.value
+      for (const op of ops) next = applySet(next, op.path, op.value)
+      // The real Host answers with the accepted namespace view.
+      form.emit({ value: next, revision: form.snapshot.revision + 1 })
+      return true
+    },
+  }
+  return form
 }
 
 /** One popup: a shell that contains a listbox carrying (or not) the highlight. */
@@ -283,7 +367,11 @@ assert.deepEqual(Object.keys(zh).sort(), [
   'io.export', 'io.import', 'io.imported', 'io.title',
   'nav', 'page.title',
   'preset.dsh', 'preset.dsh.desc', 'preset.plugin', 'preset.plugin.desc', 'preset.title',
-  'select.aria', 'status.draft', 'status.dsh', 'status.plugin', 'status.saved',
+  'select.aria',
+  'sideChat.conflict', 'sideChat.follow', 'sideChat.limit',
+  'sideChat.loading', 'sideChat.missing', 'sideChat.mode.enter', 'sideChat.mode.modEnter',
+  'sideChat.rejected', 'sideChat.synced', 'sideChat.title',
+  'status.draft', 'status.dsh', 'status.plugin', 'status.saved',
   'storage.volatile',
 ].sort())
 assert.equal(zh['action.newline'], '换行', 'the action is called 换行, not 插入换行')
@@ -470,8 +558,15 @@ assert.equal(api.version, pkg.version, 'the API version matches package.json')
 assert.equal(first.plugin.__test.VERSION, pkg.version, 'the bundled VERSION constant matches package.json')
 assert.deepEqual(Object.keys(api.getStatus()).sort(), [
   'anchor', 'bindings', 'busyEnter', 'composers', 'lastKey',
-  'menuBlocks', 'plugin', 'preset', 'storage', 'version',
+  'menuBlocks', 'plugin', 'preset', 'sideChat', 'storage', 'version',
 ])
+assert.deepEqual(api.getStatus().sideChat, {
+  present: false,
+  mode: null,
+  follow: false,
+  namespaces: 0,
+  sync: 'off',
+})
 assert.equal(api.getStatus().preset, 'plugin')
 assert.equal(api.getStatus().busyEnter, 'unknown', 'no settings service means unknown')
 // Every mount is a fresh factory closure, so nothing has been seen yet.
@@ -815,6 +910,174 @@ assert.equal(first.plugin.__test.buildExportDocument().includes('"plugin": "dsh-
 const iconTree = icon.component({ size: 20, active: true })
 assert.equal(iconTree.props.width, 20)
 assert.equal(iconTree.props.stroke, 'currentColor')
+
+// --- side chat (dsh-better-sidebar) ---------------------------------------
+const switcher = pageTree => buttons(pageTree).find(el => el.props.role === 'switch')
+const sideModeOf = () => fakeWindow.__dshEnterNewline.getStatus().sideChat
+
+// Units: namespace discovery by schema shape, and the projection rule.
+const { findSideChatNamespace, projectSideChatMode, readSideChatMode } = first.plugin.__test
+assert.equal(findSideChatNamespace(undefined), null)
+assert.equal(findSideChatNamespace({ namespaces: [{ ns: 'ui-chat', schema: { dict: { busyEnter: {} } } }] }), null)
+// The Host sends schemastery's compressed envelope, so the root node is refs[uid].
+assert.equal(
+  findSideChatNamespace({
+    namespaces: [
+      { ns: 'ui-chat', schema: { uid: 1, refs: { 1: { type: 'object', dict: { busyEnter: 2 } } } } },
+      {
+        ns: 'web-ui-better-sidebar',
+        schema: { uid: 15, refs: { 15: { type: 'object', dict: { pluginSettings: 13, tabsEnabled: 14 } } } },
+      },
+    ],
+  }),
+  'web-ui-better-sidebar',
+  'the compressed envelope is read at refs[uid], and a re-mounted row id is still found',
+)
+// A plain (uncompressed) schema is still understood, for defensive parity.
+assert.equal(
+  findSideChatNamespace({ namespaces: [{ ns: 'better-sidebar', schema: { dict: { pluginSettings: {}, tabsEnabled: {} } } }] }),
+  'better-sidebar',
+)
+assert.equal(findSideChatNamespace({ namespaces: [{ ns: 'x', schema: { uid: 9, refs: {} } }] }), null)
+// Second pass: the resolved side-chat blob identifies the row even when the
+// schema field names change.
+assert.equal(
+  findSideChatNamespace({
+    namespaces: [
+      { ns: 'ui-chat', schema: { dict: {} }, value: { busyEnter: 'queue' } },
+      { ns: 'renamed-sidebar', schema: { dict: { other: 1 } }, value: { pluginSettings: { sidechat: { submitKey: 'enter' } } } },
+    ],
+  }),
+  'renamed-sidebar',
+)
+assert.equal(readSideChatMode(undefined), null, 'an unresolved section reports nothing')
+assert.equal(readSideChatMode({}), 'enter', 'the side card treats an absent value as enter')
+assert.equal(readSideChatMode({ pluginSettings: { sidechat: { submitKey: 'mod-enter' } } }), 'mod-enter')
+assert.equal(projectSideChatMode(), 'mod-enter', 'Enter=newline projects onto the chord mode')
+assert.equal(first.plugin.__test.SIDE_CHAT_KEY, 'composer-enter-newline:sidechat-sync')
+
+// Without the side card the section explains itself and offers no switch.
+suite = mountPage()
+tree = suite.render()
+dict = suite.dict
+assert.ok(textOf(tree).includes(dict['sideChat.missing']), 'a missing side card is stated')
+assert.equal(switcher(tree), undefined, 'no switch without a side card')
+assert.deepEqual(sideModeOf(), { present: false, mode: null, follow: false, namespaces: 0, sync: 'off' })
+
+// A detected side card shows its own mode, read-only, while following is off.
+suite = mountPage({ sidebar: 'enter' })
+tree = suite.render()
+dict = suite.dict
+let sideForm = suite.sidebarForm
+assert.equal(sideForm.calls.length, 0, 'a fresh page writes nothing')
+assert.ok(textOf(tree).includes(dict['sideChat.mode.enter']), 'the side card mode is shown')
+assert.ok(textOf(tree).includes(dict['sideChat.limit']), 'the third-key limitation is stated')
+assert.equal(switcher(tree).props['aria-checked'], false, 'following starts off')
+assert.equal(sideModeOf().present, true)
+assert.equal(sideModeOf().mode, 'enter')
+
+// Turning it on projects our Enter mapping into the side card's own mode.
+switcher(tree).props.onClick()
+await wait(0)
+tree = suite.render()
+assert.deepEqual(sideForm.calls[0], [
+  { op: 'set', path: ['pluginSettings', 'sidechat', 'submitKey'], value: 'mod-enter' },
+], 'enabling writes the projected mode through the declared settings seam')
+assert.equal(sideModeOf().sync, 'on')
+assert.equal(sideModeOf().mode, 'mod-enter')
+assert.ok(textOf(tree).includes(dict['sideChat.mode.modEnter']), 'the read-only line follows the side card')
+assert.ok(statusTexts(tree).includes(dict['sideChat.synced']))
+
+// A change the user makes on the side card's own page stops following.
+sideForm.emit({ value: { pluginSettings: { sidechat: { submitKey: 'enter' } } } })
+await wait(0)
+tree = suite.render()
+assert.equal(sideModeOf().follow, false, 'a manual side-card change turns following off')
+assert.equal(sideModeOf().sync, 'conflict')
+assert.ok(textOf(tree).includes(dict['sideChat.conflict']))
+assert.equal(sideForm.calls.length, 1, 'and it does not fight that choice')
+
+// Our own mapping change re-projects instead of looking like a user edit.
+suite = mountPage({ sidebar: 'mod-enter' })
+tree = suite.render()
+dict = suite.dict
+sideForm = suite.sidebarForm
+switcher(tree).props.onClick()
+await wait(0)
+assert.equal(sideForm.calls.length, 0, 'nothing to write when both sides already agree')
+assert.equal(sideModeOf().follow, true)
+selects(suite.render())[0].props.onChange({ target: { value: 'steer' } })
+tree = suite.render()
+selects(tree)[1].props.onChange({ target: { value: 'newline' } })
+tree = suite.render()
+button(tree, '保存').props.onClick()
+await wait(0)
+tree = suite.render()
+assert.deepEqual(sideForm.calls.at(-1), [
+  { op: 'set', path: ['pluginSettings', 'sidechat', 'submitKey'], value: 'enter' },
+], 'Enter now sending re-projects onto the side card enter mode')
+assert.equal(sideModeOf().follow, true, 'our own re-projection never turns following off')
+assert.equal(sideModeOf().sync, 'on')
+
+// The default preset means "native everywhere", so the side card sends with Enter.
+suite = mountPage({ sidebar: 'mod-enter' })
+tree = suite.render()
+dict = suite.dict
+sideForm = suite.sidebarForm
+switcher(tree).props.onClick()
+await wait(0)
+radio(tree, '默认配置').props.onClick()
+await wait(0)
+tree = suite.render()
+assert.deepEqual(sideForm.calls.at(-1), [
+  { op: 'set', path: ['pluginSettings', 'sidechat', 'submitKey'], value: 'enter' },
+], 'the default preset projects onto the side card enter mode')
+assert.equal(sideModeOf().follow, true, 'a preset switch is our own change, not a conflict')
+assert.equal(sideModeOf().mode, 'enter')
+
+// A snapshot that arrives while the write is in flight is not a user edit.
+suite = mountPage({ sidebar: 'enter' })
+tree = suite.render()
+dict = suite.dict
+sideForm = suite.sidebarForm
+let release = null
+sideForm.hold = new Promise((resolve) => { release = resolve })
+switcher(tree).props.onClick()
+await wait(0)
+assert.equal(sideModeOf().follow, true, 'an in-flight write keeps the switch on')
+sideForm.emit({ value: { pluginSettings: { sidechat: { submitKey: 'enter' } } } })
+await wait(0)
+assert.equal(sideModeOf().follow, true, 'a stale snapshot during the write is not a user edit')
+sideForm.hold = null
+release()
+await wait(0)
+tree = suite.render()
+assert.equal(sideModeOf().mode, 'mod-enter', 'the accepted write becomes the live mode')
+assert.equal(sideModeOf().follow, true)
+assert.equal(sideForm.calls.length, 1)
+
+// A refused write keeps the local switch on and says so.
+suite = mountPage({ sidebar: 'enter' })
+tree = suite.render()
+dict = suite.dict
+sideForm = suite.sidebarForm
+sideForm.accept = false
+switcher(tree).props.onClick()
+await wait(0)
+tree = suite.render()
+assert.equal(sideModeOf().sync, 'rejected')
+assert.equal(sideModeOf().follow, true, 'a refusal does not silently disable following')
+assert.ok(textOf(tree).includes(dict['sideChat.rejected']))
+assert.equal(sideForm.calls.length, 1)
+
+// A persisted "on" re-projects on the next boot.
+suite = mountPage({ sidebar: 'enter', sidechatFollow: true })
+tree = suite.render()
+await wait(0)
+assert.equal(suite.sidebarForm.calls.length, 1, 'booting with following on re-projects')
+assert.equal(suite.sidebarForm.calls[0][0].value, 'mod-enter')
+assert.equal(sideModeOf().follow, true)
+assert.equal(sideModeOf().mode, 'mod-enter')
 
 // --- storage failure is reported, then cleared once writes work again ------
 // Runs last: it leaves the fake store's setItem swapped out for two renders.

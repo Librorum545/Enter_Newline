@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Enter newline",
-    "description": "Two composer key configurations: the plugin configuration makes Enter a line break, Ctrl/Cmd+Enter steer and Shift+Enter queue (each rebindable on its own Settings page); the default configuration hot-disables the plugin, hands every key back to DSH and shows what DSH does. Includes an IME-safe replay, fail-safe handling of the completion menu and a renamed composer anchor, one-click restore of the plugin default, JSON export/import of the saved configuration, and a console self-check (window.__dshEnterNewline).",
+    "description": "Two composer key configurations: the plugin configuration makes Enter a line break, Ctrl/Cmd+Enter steer and Shift+Enter queue (each rebindable on its own Settings page); the default configuration hot-disables the plugin, hands every key back to DSH and shows what DSH does. Includes an IME-safe replay, fail-safe handling of the completion menu and a renamed composer anchor, one-click restore of the plugin default, JSON export/import of the saved configuration, a read-only view of the dsh-better-sidebar side-chat submit key that can follow this mapping, and a console self-check (window.__dshEnterNewline).",
     "detail": "docs/DETAIL.md"
   }
 }

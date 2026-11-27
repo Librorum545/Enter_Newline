@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Enter 换行",
-    "description": "两套输入框按键配置：插件配置下 Enter 换行、Ctrl/Cmd+Enter 插话发送、Shift+Enter 排队发送（可在独立设置页逐键调整）；默认配置热关闭插件，把三个键全部交还 DSH，并按 DSH 的「繁忙时 Enter」显示每个键的行为。附带输入法安全的按键重放、补全菜单与输入框锚点失效时的失败安全、一键恢复插件预设、配置的 JSON 导出/导入，以及控制台自检（window.__dshEnterNewline）。",
+    "description": "两套输入框按键配置：插件配置下 Enter 换行、Ctrl/Cmd+Enter 插话发送、Shift+Enter 排队发送（可在独立设置页逐键调整）；默认配置热关闭插件，把三个键全部交还 DSH，并按 DSH 的「繁忙时 Enter」显示每个键的行为。附带输入法安全的按键重放、补全菜单与输入框锚点失效时的失败安全、一键恢复插件预设、配置的 JSON 导出/导入、设置页只读显示并可跟随 dsh-better-sidebar 侧边对话的发送键，以及控制台自检（window.__dshEnterNewline）。",
     "detail": "docs/DETAIL.zh.md"
   }
 }

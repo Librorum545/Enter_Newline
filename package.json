@@ -1,6 +1,6 @@
 {
   "name": "dsh-enter-newline",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "description": "Two composer key configurations: the plugin configuration maps Enter to a line break and Ctrl/Cmd+Enter / Shift+Enter to steer / queue; the default configuration hot-disables the plugin and hands every key back to DSH. Includes a one-click restore of the plugin default and JSON export/import of the saved configuration.",
   "license": "MIT",
   "author": "Librorum",

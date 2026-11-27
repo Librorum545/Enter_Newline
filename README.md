@@ -16,8 +16,9 @@
 - **补全菜单三态**：有高亮候选时让给菜单；菜单打开但没有高亮时，宿主会把它误判成提交，插件直接吞掉（不发、不换行）；没有菜单才按映射执行。页面别处的 listbox 不会让当前输入框失效
 - **改版失败安全**：`[data-composer-input]` 不存在时只告警一次，并在输入框卡片内吞掉发送类 Enter（含 Ctrl/Cmd+Enter）——宁可“回车没反应”，也不把半截草稿发出去；Shift+Enter 仍由宿主换行
 - **全 composer 生效**：主输入框和右侧边栏的子智能体会话一视同仁；只改前端按键映射，不改变 Host 的投递语义。
+- **侧边对话联动（可选）**：装了 `dsh-better-sidebar` 时，设置页会以只读方式显示它侧边对话当前的发送键，并可打开「跟随本插件的映射」——打开后本插件的 Enter 语义会被投影写入侧边栏自己的设置（Enter 换行 → 侧边栏改用 Ctrl/Cmd+Enter 发送），全程走它自己的按键实现，不抢键、不替换输入框
 - **可观测和迁移**：`window.__dshEnterNewline` 暴露预设、映射、`busyEnter`、锚点状态、最近一次按键决策与菜单拦截计数；设置页「复制诊断」一键取快照。配置可导出/导入 JSON（校验插件与格式）；浏览器存储写失败时页面会明说“只在本次会话生效”，不谎报已保存，恢复写入后提示自动撤掉
-- **轻量**：零依赖，逻辑集中在浏览器半件 `client.js` (约 49 KB，含注释)，Host 入口只是占位；无构建步骤，用 `link:` 安装时改完保存约半秒热加载
+- **轻量**：零依赖，逻辑集中在浏览器半件 `client.js` (约 66 KB，含注释)，Host 入口只是占位；无构建步骤，用 `link:` 安装时改完保存约半秒热加载
 
 ## 安装
 
@@ -52,6 +53,7 @@ dsh plugin --profile web add github:Librorum545/Enter_Newline#<commit>
 - 顶部「当前生效」一行摘要：一眼确认现在哪套配置、三个键分别是什么（默认配置下由 `ui-conversation` 的 `busyEnter` 换算）。改了下拉但还没保存时，摘要下方会多出一行「未保存：…」：第一行始终描述**此刻按键真正会发生什么**，第二行才是草稿。
 - 两张配置卡片：「默认配置」热关闭插件、把三个键交还 DSH；「插件配置」是用户自定义配置。只有选中「插件配置」时才显示三个下拉、恢复插件预设、放弃和保存。
 - 「输入框锚点：已检测到 / 未检测到」：DSH 改版导致 `[data-composer-input]` 不存在时会提示，并在控制台告警一次。
+- 「侧边对话（dsh-better-sidebar）」：检测到它已启用时，一行只读文案显示它当前的发送键（`Enter 发送` 或 `Ctrl/Cmd+Enter 发送`），无论跟随开关开不开都跟着它的设置实时变化；开关只决定「要不要把本插件的新映射写过去」。它只有两态，所以只同步**哪个键发送**：本插件 Enter 是换行时侧边栏用 Ctrl/Cmd+Enter 发送，Enter 是发送时侧边栏用 Enter 发送，Shift+Enter 在那边始终换行。开关状态存在 `composer-enter-newline:sidechat-sync`，不随导出/导入迁移。
 - 「导出 / 导入」：导出当前已保存的方案为 JSON；粘贴 JSON 后点「导入」立即生效。
 
 导出格式：
@@ -144,6 +146,7 @@ window.__dshEnterNewline.inspect()        // 快照的格式化 JSON
 | `lastKey` | 最近一次 Enter 的 `{ at, gesture, decision }`，`decision` 说明这次为什么换行/为什么让路/为什么被吞 |
 | `menuBlocks` | 被“菜单无高亮”吞掉的次数 |
 | `storage` | `local`（已持久化）或 `volatile`（浏览器存储不可用，仅本次会话） |
+| `sideChat` | 侧边对话联动：`{ present, mode, follow, namespaces, sync }`。`present` = 检测到 `dsh-better-sidebar`；`mode` = 它当前的发送键（`enter` / `mod-enter` / `null`）；`follow` = 跟随开关；`namespaces` = 设置文档报告的命名空间条数（排查“未检测到”用，`null` 表示还没读到）；`sync` = `off` / `on` / `rejected` / `conflict` |
 
 `lastKey.decision` 取值：`preset-dsh`、`composing`、`readonly`、`reserved`、`menu-pick`、`menu-blocked`、`newline`、`native-newline`、`steer`、`queue`、`ime-deferred`、`anchor-missing-blocked`。
 
@@ -169,6 +172,8 @@ window.__dshEnterNewline.inspect()        // 快照的格式化 JSON
 - 输入框为空、且队列里已有消息时，走 Ctrl/Cmd 通道的动作按 DSH 原生语义变成「插话全部排队消息」。
 - 按键映射与配置存在浏览器本地，不同浏览器/不同机器需要各自设置；1.3.0 起提供导出/导入用于迁移。
 - 浏览器存储不可用时（隐私模式、配额满）设置只对本次会话生效：设置页会明确提示，`getStatus().storage` 显示 `volatile`；之后只要有一次写入成功，提示会自动撤掉、`storage` 回到 `local`，不会一直挂着过期警告。
+- 侧边对话联动依赖 `dsh-better-sidebar` 的 `pluginSettings.sidechat.submitKey`（它声明为开放字段）。它只有「发送 / 换行」两态，所以只同步 Enter 的语义，第三个键（Shift+Enter）在侧边对话里始终是换行；它的客户端只在启动时读一次设置，写入后可能要刷新页面或重开面板才生效（它自己改设置是即时生效的）。
+- 跟随开关打开期间，如果你在侧边栏自己的设置页改了发送键，本插件会把手动改动认作「你另有选择」，自动关掉跟随并提示——它不会两个方向互相覆盖。开关关掉时本插件不写它的设置，只读显示。
 - 内置的「繁忙时的发送行为」说明文字由 `ui-conversation` 拥有，插件无法替换（同一 locale 命名空间与语言只允许一个所有者）；想改那段文字只能走 DSH 上游。
 - 浏览器半件由 client-hmr 热加载（见「热加载」）；Host 半件与插件行的增删仍需要重启桌面端。
 
@@ -187,6 +192,7 @@ window.__dshEnterNewline.inspect()        // 快照的格式化 JSON
 - 配置切换立即写盘并立即生效；
 - 导出内容、导入（信封/裸映射/非法 JSON/错误格式/错误插件/非法映射）、导入成功后的存储与生效；
 - 浏览器存储写入失败时页面明确提示且不谎报“已保存”，之后写入成功时提示自动消失；
+- 侧边对话联动：没有 `dsh-better-sidebar` 时的说明文案、只读显示它的发送键（开关关闭时也跟随变化）、打开开关后按投影写入、写入被拒、我们自己的映射/预设变更触发的重新投影、写入进行中的旧快照不被误判为用户改动、用户手动改动导致自动关闭、`"on"` 状态重启后重新投影、命名空间按 schema 形状识别；
 - 中英文案键齐全且「换行」文案统一。
 
 ## 许可证
