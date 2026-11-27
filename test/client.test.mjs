@@ -283,7 +283,7 @@ assert.deepEqual(Object.keys(zh).sort(), [
   'io.export', 'io.import', 'io.imported', 'io.title',
   'nav', 'page.title',
   'preset.dsh', 'preset.dsh.desc', 'preset.plugin', 'preset.plugin.desc', 'preset.title',
-  'select.aria', 'status.dsh', 'status.plugin', 'status.saved',
+  'select.aria', 'status.draft', 'status.dsh', 'status.plugin', 'status.saved',
   'storage.volatile',
 ].sort())
 assert.equal(zh['action.newline'], '换行', 'the action is called 换行, not 插入换行')
@@ -441,6 +441,25 @@ fire('compositionstart')
 fire('compositionend')
 ;({ replay } = press(lineComposer))
 assert.equal(replay?.shiftKey, true, 'a line break is replayed immediately after compositionend')
+
+// Esc calls the deferred send off; any other key leaves it queued.
+const escComposer = makeComposer()
+fire('compositionstart')
+fire('compositionend')
+;({ event } = press(escComposer, { ctrlKey: true }))
+assert.ok(event.defaultPrevented, 'the post-composition send is held inside the window')
+press(escComposer, { key: 'Escape', keyCode: 27 })
+await wait(30)
+assert.equal(escComposer.events.length, 0, 'Escape cancels the deferred send')
+assert.equal(logs.info.some(args => args[1] === 'deferred send cancelled by Escape'), true, 'the cancel is logged')
+
+const keepComposer = makeComposer()
+fire('compositionstart')
+fire('compositionend')
+;({ event } = press(keepComposer, { ctrlKey: true }))
+press(keepComposer, { key: 'a', keyCode: 65 })
+await wait(30)
+assert.equal(keepComposer.events.length, 1, 'an unrelated key does not cancel the deferred send')
 
 // --- diagnostics API --------------------------------------------------------
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
@@ -618,8 +637,14 @@ assert.equal(saveButton(tree).props.style.background, 'var(--dsw-alias-bg-module
 rows[0].props.onChange({ target: { value: 'steer' } })
 tree = suite.render()
 assert.equal(saveButton(tree).props.disabled, false, 'save is enabled after a change')
+assert.ok(
+  textOf(tree).includes('当前生效：Enter = 换行 · Ctrl/Cmd+Enter = 插话发送 · Shift+Enter = 排队发送'),
+  'the live line keeps describing the saved map',
+)
+assert.ok(textOf(tree).includes('未保存：Enter = 插话发送'), 'the draft line names the edited mapping')
 rows[0].props.onChange({ target: { value: 'newline' } })
 tree = suite.render()
+assert.equal(textOf(tree).includes('未保存：'), false, 'reverting the draft drops the draft line')
 assert.equal(saveButton(tree).props.disabled, true, 'reverting to the saved map disables save again')
 
 // All-newline is refused on Save, and nothing is persisted.
@@ -641,6 +666,7 @@ tree = suite.render()
 assert.ok(statusTexts(tree).includes(dict['status.saved']), 'saved status appears')
 assert.deepEqual(JSON.parse(storage.get(STORAGE_KEY)), { enter: 'steer', ctrlEnter: 'queue', shiftEnter: 'newline' })
 assert.ok(textOf(tree).includes('当前生效：Enter = 插话发送 · Ctrl/Cmd+Enter = 排队发送 · Shift+Enter = 换行'))
+assert.equal(textOf(tree).includes('未保存：'), false, 'saving clears the draft line')
 assert.equal(saveButton(tree).props.disabled, true, 'a saved map disables save again')
 assert.ok(logs.info.some(args => args[1] === 'bindings saved'), 'save logs the new bindings')
 
@@ -790,10 +816,8 @@ const iconTree = icon.component({ size: 20, active: true })
 assert.equal(iconTree.props.width, 20)
 assert.equal(iconTree.props.stroke, 'currentColor')
 
-// --- storage failure is reported, not swallowed ----------------------------
-// Runs last: a failed write keeps the page in "this session only" mode for the
-// rest of the session, exactly like the real plugin.
-mountPage()
+// --- storage failure is reported, then cleared once writes work again ------
+// Runs last: it leaves the fake store's setItem swapped out for two renders.
 const realSetItem = fakeWindow.localStorage.setItem
 fakeWindow.localStorage.setItem = () => { throw new Error('quota exceeded') }
 suite = mountPage()
@@ -805,10 +829,24 @@ button(tree, '保存').props.onClick()
 tree = suite.render()
 assert.ok(textOf(tree).includes(dict['storage.volatile']), 'a failed write is surfaced on the page')
 assert.equal(fakeWindow.__dshEnterNewline.getStatus().storage, 'volatile', 'the API reports the volatile store')
-assert.ok(
-  logs.warn.some(args => String(args[1] ?? '').includes('localStorage write failed')),
+assert.equal(
+  logs.warn.filter(args => String(args[1] ?? '').includes('localStorage write failed')).length,
+  1,
   'the failure is logged once',
 )
+
+// A later successful write clears the warning instead of keeping it forever.
 fakeWindow.localStorage.setItem = realSetItem
+selects(tree)[0].props.onChange({ target: { value: 'queue' } })
+tree = suite.render()
+button(tree, '保存').props.onClick()
+tree = suite.render()
+assert.equal(textOf(tree).includes(dict['storage.volatile']), false, 'the warning clears after a successful write')
+assert.equal(fakeWindow.__dshEnterNewline.getStatus().storage, 'local', 'the API reports persistence again')
+assert.equal(
+  logs.info.filter(args => String(args[1] ?? '').includes('localStorage recovered')).length,
+  1,
+  'the recovery is logged once',
+)
 
 console.log('client.js harness: all assertions passed')

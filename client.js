@@ -84,7 +84,7 @@ window.__ModuleLoader__.load({
     /** The highlight reaches the DOM only through this attribute. */
     const HIGHLIGHT_ATTR = 'aria-activedescendant'
     /** Package version exposed by the diagnostics API (`npm test` keeps it honest). */
-    const VERSION = '1.3.1'
+    const VERSION = '1.3.2'
     /** Mirrors DSH's own `composingUntil = Date.now() + 10`, with a 2ms margin. */
     const COMPOSITION_GRACE_MS = 12
     /** Replayed events, so the capture listener ignores its own dispatches. */
@@ -148,7 +148,9 @@ window.__ModuleLoader__.load({
 
     /**
      * Persist one value, remembering a failure so the page can say
-     * "this session only" instead of a false "Saved".
+     * "this session only" instead of a false "Saved". A later successful write
+     * clears the flag again: quota and private-mode failures are often
+     * transient, and a permanent warning would keep lying after recovery.
      * @param key - the storage key.
      * @param value - the serialized value.
      * @returns whether the value reached the store.
@@ -156,10 +158,17 @@ window.__ModuleLoader__.load({
     function persist(key, value) {
       try {
         window.localStorage.setItem(key, value)
+        if (storageFailed) {
+          storageFailed = false
+          console.info(LOG, 'localStorage recovered; the setting is persisted again')
+        }
         return true
       } catch {
-        storageFailed = true
-        console.warn(LOG, 'localStorage write failed; the setting only applies to this session')
+        // Log the transition only, so a full quota does not flood the console.
+        if (!storageFailed) {
+          storageFailed = true
+          console.warn(LOG, 'localStorage write failed; the setting only applies to this session')
+        }
         return false
       }
     }
@@ -468,6 +477,17 @@ window.__ModuleLoader__.load({
      */
     function onKeyDown(event) {
       if (replayed.has(event)) return
+      // Escape abandons a send still waiting out the composition window. The
+      // user is dismissing a popup or cancelling, not sending: replaying the
+      // deferred Enter after that would post a draft they meant to keep.
+      if (event.key === 'Escape') {
+        if (pendingReplay !== null) {
+          clearTimeout(pendingReplay)
+          pendingReplay = null
+          console.info(LOG, 'deferred send cancelled by Escape')
+        }
+        return
+      }
       if (event.key !== 'Enter') return
       const target = event.target
       const gesture = gestureOf(event)
@@ -592,6 +612,7 @@ window.__ModuleLoader__.load({
         'preset.plugin.desc': '用户自定义配置，可在下方逐键调整',
         'status.plugin': '当前生效：Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = {shift}',
         'status.dsh': '当前生效：Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = 换行',
+        'status.draft': '未保存：Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = {shift}（保存后生效）',
         'anchor.found': '输入框锚点：已检测到',
         'anchor.missing': '输入框锚点：未检测到（DSH 可能改版，详见控制台）',
         'anchor.unknown': '输入框锚点：尚未检测到（打开一个会话后回到此页可复查）',
@@ -628,6 +649,7 @@ window.__ModuleLoader__.load({
         'preset.plugin.desc': 'User-defined configuration; adjust each key below',
         'status.plugin': 'Active: Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = {shift}',
         'status.dsh': 'Active: Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = line break',
+        'status.draft': 'Unsaved: Enter = {enter} · Ctrl/Cmd+Enter = {ctrl} · Shift+Enter = {shift} (applies after saving)',
         'anchor.found': 'Composer anchor: detected',
         'anchor.missing': 'Composer anchor: not detected (DSH may have changed; see the console)',
         'anchor.unknown': 'Composer anchor: not detected yet (open a session and revisit this page)',
@@ -700,6 +722,13 @@ window.__ModuleLoader__.load({
         fontSize: '12px',
         lineHeight: '18px',
         color: 'var(--dsw-alias-label-secondary)',
+      },
+      // The unsaved draft line: same size as the live line, warning colour so
+      // "not in effect yet" cannot be misread as the active mapping.
+      statusDraft: {
+        fontSize: '12px',
+        lineHeight: '18px',
+        color: 'var(--dsw-alias-state-warn-primary)',
       },
       sectionTitle: {
         margin: '18px 0 0',
@@ -970,13 +999,23 @@ window.__ModuleLoader__.load({
       const busyMode = busy ?? 'queue'
       const dshEnter = t(busyMode === 'steer' ? 'action.steer' : 'action.queue')
       const dshChord = t(busyMode === 'steer' ? 'action.queue' : 'action.steer')
-      const status = presetDraft === 'dsh'
+      const status = preset === 'dsh'
         ? t('status.dsh', { enter: dshEnter, ctrl: dshChord })
         : t('status.plugin', {
           enter: t(`action.${bindings.enter}`),
           ctrl: t(`action.${bindings.ctrlEnter}`),
           shift: t(`action.${bindings.shiftEnter}`),
         })
+      // The first line is what a keystroke does right now (the saved map); the
+      // second appears only while the draft differs, so an edited select is
+      // never mistaken for a mapping that is already in effect.
+      const draftStatus = dirty && presetDraft === 'plugin'
+        ? t('status.draft', {
+          enter: t(`action.${draft.enter}`),
+          ctrl: t(`action.${draft.ctrlEnter}`),
+          shift: t(`action.${draft.shiftEnter}`),
+        })
+        : null
       // The draft and the live map both count: either one off the factory map
       // means there is something to restore.
       const atPluginDefault = sameBindings(draft, DEFAULT_BINDINGS) && sameBindings(bindings, DEFAULT_BINDINGS)
@@ -1087,7 +1126,8 @@ window.__ModuleLoader__.load({
       return h('div', { style: STYLE.page },
         h('h2', { style: STYLE.pageTitle }, t('page.title')),
         h('div', { style: STYLE.statusBox, role: 'status' },
-          h('div', { style: STYLE.statusText }, status)),
+          h('div', { style: STYLE.statusText }, status),
+          draftStatus === null ? null : h('div', { style: STYLE.statusDraft }, draftStatus)),
         h('div', { style: STYLE.sectionTitle }, t('preset.title')),
         h('div', { style: STYLE.presetList, role: 'radiogroup', 'aria-label': t('preset.title') },
           h(PresetCard, {
